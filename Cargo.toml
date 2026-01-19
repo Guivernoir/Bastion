@@ -1,0 +1,176 @@
+[package]
+name = "bastion"
+version = "0.1.0"
+edition = "2024"
+authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Hybrid post-quantum cryptographic primitives with zero-trust architecture"
+repository = "https://github.com/Guivernoir/veil-crypto"
+keywords = [
+    "cryptography",
+    "post-quantum",
+    "zero-trust",
+    "onion-routing",
+    "security",
+]
+categories = ["cryptography", "network-programming"]
+rust-version = "1.90"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE ORGANIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# tests/
+#   ├── integration_tests.rs       - End-to-end workflow tests
+#   ├── property_tests.rs          - Property-based testing with proptest
+#   └── constant_time_unit_tests.rs - Constant-time primitive tests
+#
+# benches/
+#   ├── crypto_performance.rs      - Cryptographic operation throughput
+#   ├── concurrency.rs             - Multi-threaded performance
+#   └── memory_usage.rs            - Memory footprint analysis
+#
+# fuzz/
+#   └── fuzz_targets/              - 6 fuzzing harnesses
+#       ├── fuzz_onion_decrypt.rs
+#       ├── fuzz_constant_time.rs
+#       ├── fuzz_pqc_key_exchange.rs
+#       ├── fuzz_signatures.rs
+#       ├── fuzz_arithmetic.rs
+#       └── fuzz_integration.rs
+#
+# Run tests:      cargo test
+# Run benchmarks: cargo bench
+# Run fuzzing:    cargo install cargo-fuzz && cargo fuzz run <target>
+# See TEST_SUITE_README.md for detailed documentation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+[lib]
+name = "bastion"
+path = "src/lib.rs"
+
+[dependencies]
+# AES-256-GCM for symmetric encryption
+aes-gcm = { version = "0.10", default-features = false, features = [
+    "aes",
+    "alloc",
+    "getrandom",
+] }
+
+# Post-quantum cryptography
+pqc_kyber = { version = "0.7", default-features = false }
+pqc_dilithium = { version = "0.2.0", default-features = false }
+
+# Cryptographic hashing
+sha3 = { version = "0.10", default-features = false }
+
+# Secure random number generation
+rand = { version = "0.8", default-features = false, features = [
+    "std",
+    "std_rng",
+] }
+
+# Memory security
+zeroize = { version = "1.8", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
+subtle = { version = "2.6", default-features = false }
+
+# Rate limiting for DoS protection
+governor = { version = "0.10.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Property-based testing
+proptest = "1.4"
+
+# Benchmarking with HTML reports
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Hex encoding for test assertions
+hex = "0.4"
+
+# Note: Fuzzing dependencies are managed by fuzz/Cargo.toml
+# Run: cargo install cargo-fuzz && cargo fuzz run <target>
+
+[features]
+default = ["std"]
+std = []
+
+# Enable SIMD optimizations (requires nightly or specific CPU features)
+simd = []
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+# 
+# Coverage: ~2,700 lines of test code
+# - 65+ test functions
+# - 6 fuzz targets
+# - 50+ benchmark functions
+# - 20+ property-based checks
+#
+# CI/CD Integration:
+#   cargo test --all-features              # Unit & integration tests
+#   PROPTEST_CASES=1000 cargo test         # Property tests
+#   cargo bench --no-run                   # Benchmark compilation check
+#   cargo fuzz run <target> -- -max_total_time=60  # Fuzzing (requires nightly)
+#
+# Coverage Report:
+#   cargo install cargo-tarpaulin
+#   cargo tarpaulin --out Html --output-dir coverage/
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+[profile.release]
+# Maximum optimization for cryptographic operations
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = true
+
+[profile.dev]
+# Fast compilation but maintain overflow checks
+opt-level = 1
+overflow-checks = true
+
+[profile.test]
+# Optimize tests but keep debug info
+opt-level = 2
+debug = true
+overflow-checks = true
+
+[profile.bench]
+# Benchmarking profile with debug symbols for profiling
+opt-level = 3
+lto = "thin"
+debug = true
+overflow-checks = true
+
+# Target-specific optimizations for x86_64
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# No additional dependencies needed - using std::arch intrinsics
+
+# Deny unsafe dependencies
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+# Security-critical lints
+clone_on_ref_ptr = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+
+# Performance lints
+inefficient_to_string = "warn"
+large_enum_variant = "warn"
+large_stack_arrays = "warn"

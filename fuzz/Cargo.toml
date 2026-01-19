@@ -1,0 +1,51 @@
+[package]
+name = "veil-crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.veil_crypto]
+path = ".."
+
+[[bin]]
+name = "fuzz_onion_decrypt"
+path = "fuzz_targets/fuzz_onion_decrypt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_constant_time"
+path = "fuzz_targets/fuzz_constant_time.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_pqc_key_exchange"
+path = "fuzz_targets/fuzz_pqc_key_exchange.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_signatures"
+path = "fuzz_targets/fuzz_signatures.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_arithmetic"
+path = "fuzz_targets/fuzz_arithmetic.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_integration"
+path = "fuzz_targets/fuzz_integration.rs"
+test = false
+doc = false
