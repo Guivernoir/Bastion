@@ -1,10 +1,10 @@
 [package]
-name = "bastion"
+name = "crypto_bastion"
 version = "0.1.0"
 edition = "2024"
 authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
 license = "MIT OR Apache-2.0"
-description = "Hybrid post-quantum cryptographic primitives with zero-trust architecture"
+description = "Hardened post-quantum cryptographic primitives with zero-trust architecture"
 repository = "https://github.com/Guivernoir/veil-crypto"
 keywords = [
     "cryptography",
@@ -47,7 +47,7 @@ rust-version = "1.90"
 
 
 [lib]
-name = "bastion"
+name = "crypto_bastion"
 path = "src/lib.rs"
 
 [dependencies]

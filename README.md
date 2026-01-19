@@ -30,7 +30,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bastion = "0.1.0"
+crypto-bastion = "0.1.0"
 ```
 
 ## Quick Start
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 ### Post-Quantum Key Exchange
 
 ```rust
-use bastion::pqc::*;
+use crypto_bastion::pqc::*;
 
 fn secure_channel() -> Result<()> {
     // Alice and Bob generate keypairs
@@ -92,7 +92,7 @@ fn secure_channel() -> Result<()> {
 ### Digital Signatures
 
 ```rust
-use bastion::pqc::*;
+use crypto_bastion::pqc::*;
 
 fn authenticated_message() -> Result<()> {
     let keypair = SignatureKeypair::new()?;
@@ -111,7 +111,7 @@ fn authenticated_message() -> Result<()> {
 ### Constant-Time Operations
 
 ```rust
-use bastion::constant_time::*;
+use crypto_bastion::constant_time::*;
 
 fn secure_comparison() {
     let secret = b"launch_codes_alpha_7";
