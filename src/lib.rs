@@ -1,443 +1,345 @@
-//! # Veil Crypto - Hardened Edition
+//! # Bastion — hybrid onion encryption (no-alloc public surface)
 //!
-//! Enterprise-grade post-quantum cryptographic library with STRIDE/CSF/GDPR compliance.
-//!
-//! ## Key Features
-//!
-//! - **Constant-Time Operations**: All cryptographic operations enforce timing guarantees
-//! - **Dual-Context Errors**: Internal debugging + external opacity for security
-//! - **STRIDE Coverage**: Comprehensive threat model mitigation
-//! - **CSF Alignment**: NIST Cybersecurity Framework compliance
-//! - **GDPR Compliance**: Privacy-by-design with verified zeroization
-//! - **Post-Quantum Security**: ML-KEM-1024 + ML-DSA-87 (NIST standards)
-//! - **Memory Safety**: Automatic zeroization with verification
-//! - **DoS Protection**: Built-in rate limiting (1000 ops/sec symmetric, 100 ops/sec PQC)
-//! - **No-Clone Semantics**: Zero-copy architecture prevents side-channel attacks
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Application Layer
-//!     ↓
-//! Crypto Operations (AES-GCM, ML-KEM, ML-DSA)
-//!     ↓
-//! Hardened Standard (Constant-Time, Dual-Context Errors, Audit)
-//!     ↓
-//! Security Enforcement (Rate Limiting, Zeroization, Timing Guards)
-//! ```
-//!
-//! ## Usage Example
-//!
-//! ```rust,no_run
-//! use veil_crypto::*;
-//!
-//! # fn main() -> Result<()> {
-//! // 3-layer onion encryption
-//! let encryptor = OnionEncryptor::new(
-//!     [1u8; 32],  // entry key
-//!     [2u8; 32],  // relay key
-//!     [3u8; 32],  // exit key
-//! )?;
-//!
-//! let ciphertext = encryptor.encrypt(b"Secret message")?;
-//!
-//! // Decryption with automatic audit logging
-//! let decryptor = OnionDecryptor::new([1u8; 32])?;
-//! let plaintext = decryptor.decrypt(&ciphertext)?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Security Guarantees
-//!
-//! ### STRIDE Compliance
-//!
-//! - **Spoofing**: Post-quantum signatures (ML-DSA-87)
-//! - **Tampering**: Authenticated encryption (AES-256-GCM)
-//! - **Repudiation**: Comprehensive audit logging
-//! - **Information Disclosure**: Opaque errors, memory zeroization
-//! - **Denial of Service**: Rate limiting
-//! - **Elevation of Privilege**: Immutable keys, principle of least privilege
-//!
-//! ### GDPR Compliance
-//!
-//! - Data minimization (no PII in errors)
-//! - Purpose limitation (keys used only for crypto)
-//! - Storage limitation (automatic zeroization)
-//! - Right to erasure (verified zeroization)
-//!
-//! See [SECURITY.md](../SECURITY.md) for detailed compliance documentation.
+//! Public APIs:
+//! - [`encrypt`]: AES-256-GCM encrypt
+//! - [`encapsulate`]: ML-KEM-1024 encapsulate
+//! - [`sign`]: ML-DSA-87 detached signature
+//! - [`hash`]: SHA-512 digest
+//! - [`compare`]: constant-time byte-slice equality
+//! - [`layer_encrypt`]: fixed 3-layer hybrid onion
+//! - [`onion`]: variable-layer hybrid onion
 
-#![deny(unsafe_code)]
-#![warn(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::clone_on_ref_ptr
-)]
+#![allow(unsafe_code)]
+#![allow(dead_code)]
+#![deny(clippy::clone_on_ref_ptr)]
+#![warn(clippy::unwrap_used, clippy::panic)]
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-// Core modules
-pub mod error;
-pub mod constant_time;
-pub mod audit;
-pub mod pqc;
+mod algos;
+mod audit;
+mod constant_time;
+mod error;
+mod os_random;
+mod pqc;
+mod zeroize;
 
-// Re-exports for convenience
-pub use error::{CryptoError, CryptoErrorKind, ErrorSeverity, Result, StrideCategory};
-pub use constant_time::{ct_eq, ct_zeroize_verify, TimingGuard};
-pub use audit::{log_audit_event, AuditEvent, METRICS};
+use error::{CryptoError, Result};
 
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
-    Aes256Gcm, Nonce,
+use crate::algos::aes256gcm::aes::Key256;
+use crate::algos::aes256gcm::{Aes256Gcm, Nonce};
+use crate::constant_time::{
+    ct_copy_if, ct_eq, ct_hamming_weight, ct_in_range, ct_mod_reduce, ct_xor,
 };
-use governor::{
-    clock::DefaultClock, state::InMemoryState, state::NotKeyed, Quota, RateLimiter,
-};
-use std::num::NonZeroU32;
-use std::sync::Arc;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::os_random::fill_os_random_array;
+use crate::zeroize::zeroize_array;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CONSTANTS - Security Parameters
-// ═══════════════════════════════════════════════════════════════════════════
+/// ML-KEM-1024 public key size (bytes).
+pub(crate) const KEM_PK_SIZE: usize = pqc::KEM_PK_SIZE;
+/// ML-KEM-1024 ciphertext size (bytes).
+pub(crate) const KEM_CT_SIZE: usize = pqc::KEM_CT_SIZE;
+/// ML-DSA-87 detached signature size (bytes).
+pub(crate) const DSA_SIG_SIZE: usize = pqc::DSA_SIG_SIZE;
 
-/// AES-GCM nonce size in bytes (96 bits)
-pub const NONCE_SIZE: usize = 12;
+const NONCE_SIZE: usize = 12;
+const TAG_SIZE: usize = 16;
 
-/// AES-GCM authentication tag size in bytes (128 bits)
-pub const TAG_SIZE: usize = 16;
+/// Per-layer fixed overhead in bytes.
+pub(crate) const LAYER_OVERHEAD: usize = KEM_CT_SIZE + NONCE_SIZE + TAG_SIZE + DSA_SIG_SIZE;
 
-/// AES-256 key size in bytes
-pub const KEY_SIZE: usize = 32;
+/// Best-effort timing floors for the public API wrappers (ns).
+const FLOOR_PUBLIC_ENCRYPT_NS: u64 = 50_000;
+const FLOOR_PUBLIC_ENCAPSULATE_NS: u64 = 120_000;
+const FLOOR_PUBLIC_SIGN_NS: u64 = 300_000;
+const FLOOR_PUBLIC_HASH_NS: u64 = 40_000;
+const FLOOR_PUBLIC_COMPARE_NS: u64 = 40_000;
+const FLOOR_PUBLIC_LAYER_NS: u64 = 800_000;
+const FLOOR_PUBLIC_ONION_NS: u64 = 800_000;
 
-/// Minimum valid encrypted packet size (nonce + tag)
-const MIN_PACKET_SIZE: usize = NONCE_SIZE + TAG_SIZE;
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Rate limit for symmetric operations (ops per second) - STRIDE: DoS protection
-const SYMMETRIC_RATE_LIMIT: u32 = 1000;
+const KEY_MIN_HAMMING_WEIGHT: u32 = 64;
+const KEY_MAX_HAMMING_WEIGHT: u32 = 192;
 
-/// Expected minimum time for AES-256-GCM encryption (nanoseconds)
-/// Used for constant-time verification and side-channel protection
-const MIN_ENCRYPT_TIME_NS: u64 = 5_000; // 5 microseconds
-
-/// Expected minimum time for AES-256-GCM decryption (nanoseconds)
-const MIN_DECRYPT_TIME_NS: u64 = 5_000;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// TYPES
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Rate limiter for cryptographic operations (DoS protection)
-type CryptoRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// UTILITY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Create rate limiter for symmetric crypto operations
 #[inline]
-fn create_rate_limiter() -> CryptoRateLimiter {
-    Arc::new(RateLimiter::direct(Quota::per_second(
-        NonZeroU32::new(SYMMETRIC_RATE_LIMIT).expect("Rate limit must be non-zero"),
-    )))
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ONION LAYER - Single Encryption Layer with Hardened Security
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Single encryption layer for onion routing with hardened security
-///
-/// ## Security Enhancements (Hardened Edition)
-///
-/// - **Constant-Time Operations**: Timing guards enforce execution time bounds
-/// - **Audit Logging**: All operations logged with STRIDE classification
-/// - **Memory Safety**: Keys zeroized immediately after use
-/// - **Rate Limiting**: DoS protection (1000 ops/sec)
-/// - **Error Context**: Dual context (internal debugging + external opacity)
-/// - **No-Clone Semantics**: Single-owner architecture prevents memory bloat
-///
-/// ## Packet Format
-///
-/// ```text
-/// ┌──────────┬───────────────┬─────────┐
-/// │  Nonce   │  Ciphertext   │   Tag   │
-/// │ (12 B)   │  (variable)   │ (16 B)  │
-/// └──────────┴───────────────┴─────────┘
-/// ```
-#[derive(ZeroizeOnDrop)]
-pub struct OnionLayer {
-    #[zeroize(skip)]
-    cipher: Aes256Gcm,
-    #[zeroize(skip)]
-    rate_limiter: CryptoRateLimiter,
-}
-
-impl OnionLayer {
-    /// Create layer from 32-byte key
-    ///
-    /// Key is consumed (moved) and zeroized after cipher initialization.
-    /// This prevents accidental key duplication (STRIDE: Information Disclosure).
-    pub fn from_key(mut key: [u8; KEY_SIZE]) -> Result<Self> {
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| CryptoError::encryption_failed("AES-GCM initialization failed"))?;
-        
-        // Zeroize key immediately after use (GDPR: Right to Erasure)
-        key.zeroize();
-        
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "onion_layer_create",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            "OnionLayer initialized",
-        );
-        
-        Ok(Self {
-            cipher,
-            rate_limiter: create_rate_limiter(),
+fn validate_key_entropy(key: &[u8; 32]) -> Result<()> {
+    let weight: u32 = key
+        .chunks_exact(4)
+        .map(|chunk| {
+            ct_hamming_weight(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         })
+        .sum();
+
+    if !ct_in_range(weight, KEY_MIN_HAMMING_WEIGHT, KEY_MAX_HAMMING_WEIGHT) {
+        return Err(CryptoError::key_exchange_failed(
+            "derived key entropy outside accepted range",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn fill_layer_nonce(out: &mut [u8; NONCE_SIZE]) -> Result<()> {
+    let mut os_nonce = [0u8; NONCE_SIZE];
+    fill_os_random_array(&mut os_nonce)?;
+
+    let raw_counter = NONCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let reduced = ct_mod_reduce(raw_counter as u32, 0x00FF_FFFFu32);
+    let mut counter_frame = [0u8; NONCE_SIZE];
+    counter_frame[NONCE_SIZE - 3] = (reduced >> 16) as u8;
+    counter_frame[NONCE_SIZE - 2] = (reduced >> 8) as u8;
+    counter_frame[NONCE_SIZE - 1] = reduced as u8;
+
+    ct_xor(&os_nonce, &counter_frame, out);
+    zeroize_array(&mut os_nonce);
+    zeroize_array(&mut counter_frame);
+    Ok(())
+}
+
+#[inline]
+fn enforce_public_floor(start: Instant, floor_ns: u64) {
+    loop {
+        let elapsed = core::hint::black_box(start.elapsed().as_nanos() as u64);
+        if elapsed >= floor_ns {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn required_onion_len(plaintext_len: usize, layers: usize) -> Result<usize> {
+    let layer_bytes = layers
+        .checked_mul(LAYER_OVERHEAD)
+        .ok_or_else(|| CryptoError::internal("layer size overflow"))?;
+    plaintext_len
+        .checked_add(layer_bytes)
+        .ok_or_else(|| CryptoError::internal("packet size overflow"))
+}
+
+#[inline]
+fn wrap_layer_in_place(
+    buf: &mut [u8],
+    cur_offset: usize,
+    cur_len: usize,
+    kem_pk: &[u8],
+    dsa_sk: &[u8],
+) -> Result<()> {
+    if cur_offset < LAYER_OVERHEAD {
+        return Err(CryptoError::internal("invalid layer offset"));
     }
 
-    /// Encrypt plaintext with constant-time guarantees
-    ///
-    /// ## Security Features
-    ///
-    /// - Timing guard enforces minimum execution time
-    /// - Rate limiting prevents DoS attacks
-    /// - Random nonce generation (never reused)
-    /// - Audit logging with STRIDE classification
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Box<[u8]>> {
-        // Rate limiting check (STRIDE: Denial of Service)
-        self.rate_limiter
-            .check()
-            .map_err(|_| {
-                let err = CryptoError::rate_limit_exceeded("Symmetric encryption rate limit hit");
-                audit::log_error(&err, "encrypt");
-                err
-            })?;
+    let new_offset = cur_offset - LAYER_OVERHEAD;
+    let nonce_start = new_offset + KEM_CT_SIZE;
+    let ct_start = nonce_start + NONCE_SIZE;
+    let ct_end = ct_start + cur_len;
+    let signed_end = ct_end + TAG_SIZE;
+    let sig_end = signed_end + DSA_SIG_SIZE;
 
-        // Timing guard for constant-time enforcement
-        let _guard = TimingGuard::new("aes_encrypt", MIN_ENCRYPT_TIME_NS);
+    if sig_end > buf.len() {
+        return Err(CryptoError::invalid_packet("output buffer too small"));
+    }
 
-        // Generate random nonce (96 bits)
-        let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
+    let mut kem_ct = [0u8; KEM_CT_SIZE];
+    let mut aes_key = [0u8; 32];
+    let mut sig = [0u8; DSA_SIG_SIZE];
 
-        // Encrypt with AES-256-GCM (authenticated encryption)
-        let ciphertext = self.cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|_| {
-                let err = CryptoError::encryption_failed("AES-GCM encryption operation failed");
-                audit::log_error(&err, "encrypt");
-                err
-            })?;
+    let result = (|| {
+        buf.copy_within(cur_offset..cur_offset + cur_len, ct_start);
 
-        // Construct packet: nonce || ciphertext (includes auth tag)
-        let mut packet = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-        packet.extend_from_slice(&nonce);
-        packet.extend_from_slice(&ciphertext);
+        pqc::kem_encapsulate_into(kem_pk, &mut kem_ct, &mut aes_key)?;
+        validate_key_entropy(&aes_key)?;
+        buf[new_offset..new_offset + KEM_CT_SIZE].copy_from_slice(&kem_ct);
 
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "encrypt",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            format!("Encrypted {} bytes", plaintext.len()),
+        let mut nonce_arr = [0u8; NONCE_SIZE];
+        fill_layer_nonce(&mut nonce_arr)?;
+        ct_copy_if(
+            true,
+            &nonce_arr,
+            &mut buf[nonce_start..nonce_start + NONCE_SIZE],
         );
 
-        Ok(packet.into_boxed_slice())
-    }
+        let cipher = Aes256Gcm::new(Key256::from_mut_bytes(&mut aes_key));
+        let tag = cipher
+            .seal_in_place(&Nonce(nonce_arr), b"", &mut buf[ct_start..ct_end])
+            .map_err(|_| CryptoError::encryption_failed("AES-GCM encrypt_in_place failed"))?;
+        buf[ct_end..signed_end].copy_from_slice(&tag);
 
-    /// Decrypt ciphertext with tampering detection
-    ///
-    /// ## Security Features
-    ///
-    /// - Timing guard enforces constant-time execution
-    /// - Authentication tag verified (STRIDE: Tampering)
-    /// - Invalid packets rejected early
-    /// - Audit logging for tampering attempts
-    pub fn decrypt(&self, packet: &[u8]) -> Result<Box<[u8]>> {
-        // Timing guard for side-channel protection
-        let _guard = TimingGuard::new("aes_decrypt", MIN_DECRYPT_TIME_NS);
+        pqc::dsa_sign_into(dsa_sk, &buf[new_offset..signed_end], &mut sig)?;
+        buf[signed_end..sig_end].copy_from_slice(&sig);
+        Ok(())
+    })();
 
-        // Validate minimum packet size
-        if packet.len() < MIN_PACKET_SIZE {
-            let err = CryptoError::invalid_packet(format!(
-                "Packet too small: {} bytes < {} minimum",
-                packet.len(),
-                MIN_PACKET_SIZE
-            ));
-            audit::log_error(&err, "decrypt");
-            return Err(err);
-        }
-
-        // Extract nonce and ciphertext
-        let (nonce_bytes, ciphertext) = packet.split_at(NONCE_SIZE);
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        // Decrypt and verify authentication tag
-        let plaintext = self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| {
-                // Authentication failure indicates tampering
-                let err = CryptoError::decryption_failed(
-                    "AES-GCM decryption failed - authentication tag mismatch (tampering detected)"
-                );
-                audit::log_audit_event(
-                    AuditEvent::TamperingDetected,
-                    "decrypt",
-                    &StrideCategory::Tampering,
-                    &ErrorSeverity::Warning,
-                    "Authentication tag verification failed",
-                );
-                err
-            })?;
-
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "decrypt",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            format!("Decrypted {} bytes", plaintext.len()),
-        );
-
-        Ok(plaintext.into_boxed_slice())
-    }
+    zeroize_array(&mut kem_ct);
+    zeroize_array(&mut aes_key);
+    zeroize_array(&mut sig);
+    result
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ONION ENCRYPTOR - 3-Layer Encryption with Audit Trail
-// ═══════════════════════════════════════════════════════════════════════════
+fn onion_internal_into(
+    plaintext: &[u8],
+    kem_pks: &[&[u8]],
+    dsa_sks: &[&[u8]],
+    out: &mut [u8],
+) -> Result<usize> {
+    if kem_pks.is_empty() {
+        return Err(CryptoError::internal("at least one layer is required"));
+    }
+    if kem_pks.len() != dsa_sks.len() {
+        return Err(CryptoError::internal("kem_pks and dsa_sks length mismatch"));
+    }
 
-/// 3-layer onion encryption with comprehensive security
-///
-/// Each layer uses a unique key and is zeroized after use.
-/// All operations are audited for compliance and incident response.
-#[derive(ZeroizeOnDrop)]
-pub struct OnionEncryptor {
-    entry_layer: OnionLayer,
-    relay_layer: OnionLayer,
-    exit_layer: OnionLayer,
+    let layer_bytes = kem_pks
+        .len()
+        .checked_mul(LAYER_OVERHEAD)
+        .ok_or_else(|| CryptoError::internal("layer size overflow"))?;
+    let total_len = required_onion_len(plaintext.len(), kem_pks.len())?;
+    if out.len() < total_len {
+        return Err(CryptoError::invalid_packet("output buffer too small"));
+    }
+
+    let out = &mut out[..total_len];
+    let mut cur_offset = layer_bytes;
+    let mut cur_len = plaintext.len();
+    out[cur_offset..cur_offset + cur_len].copy_from_slice(plaintext);
+
+    for i in (0..kem_pks.len()).rev() {
+        wrap_layer_in_place(out, cur_offset, cur_len, kem_pks[i], dsa_sks[i])?;
+        cur_offset -= LAYER_OVERHEAD;
+        cur_len += LAYER_OVERHEAD;
+    }
+
+    Ok(total_len)
 }
 
-impl OnionEncryptor {
-    /// Create 3-layer encryptor
-    ///
-    /// Keys are consumed and zeroized after initialization.
-    pub fn new(
-        entry_key: [u8; KEY_SIZE],
-        relay_key: [u8; KEY_SIZE],
-        exit_key: [u8; KEY_SIZE],
-    ) -> Result<Self> {
-        Ok(Self {
-            entry_layer: OnionLayer::from_key(entry_key)?,
-            relay_layer: OnionLayer::from_key(relay_key)?,
-            exit_layer: OnionLayer::from_key(exit_key)?,
-        })
-    }
+/// AES-256-GCM encrypt with caller-supplied key/nonce/AAD.
+pub fn encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext_out: &mut [u8],
+    tag_out: &mut [u8; 16],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
 
-    /// Encrypt with 3 layers: exit → relay → entry
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Box<[u8]>> {
-        let layer1 = self.exit_layer.encrypt(plaintext)?;
-        let layer2 = self.relay_layer.encrypt(&layer1)?;
-        let layer3 = self.entry_layer.encrypt(&layer2)?;
-        Ok(layer3)
-    }
+    let mut key_buf = [0u8; 32];
+    ct_copy_if(true, key, &mut key_buf);
+
+    let out_ok = ciphertext_out.len() >= plaintext.len();
+    let result = if out_ok {
+        let out = &mut ciphertext_out[..plaintext.len()];
+        out.copy_from_slice(plaintext);
+
+        let gcm = Aes256Gcm::new(Key256::from_mut_bytes(&mut key_buf));
+        gcm.seal_in_place(&Nonce(*nonce), aad, out)
+            .map(|tag| {
+                tag_out.copy_from_slice(&tag);
+                plaintext.len()
+            })
+            .map_err(|_| "encryption failed")
+    } else {
+        tag_out.fill(0);
+        Err("ciphertext output buffer too small")
+    };
+
+    zeroize_array(&mut key_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_ENCRYPT_NS);
+    result
 }
 
-/// Single-layer decryptor for onion routing nodes
-#[derive(ZeroizeOnDrop)]
-pub struct OnionDecryptor {
-    layer: OnionLayer,
+/// ML-KEM-1024 encapsulation.
+pub fn encapsulate(
+    pk: &[u8],
+    ct_out: &mut [u8; 1568],
+    ss_out: &mut [u8; 32],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
+
+    let len_ok = pk.len() == KEM_PK_SIZE;
+    let mut pk_buf = [0u8; KEM_PK_SIZE];
+    ct_copy_if(len_ok, pk, &mut pk_buf);
+
+    let op = pqc::kem_encapsulate_into(&pk_buf, ct_out, ss_out).map_err(|_| "encapsulation failed");
+    let result = if len_ok {
+        op
+    } else {
+        ct_out.fill(0);
+        zeroize_array(ss_out);
+        Err("encapsulation failed")
+    };
+
+    zeroize_array(&mut pk_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_ENCAPSULATE_NS);
+    result
 }
 
-impl OnionDecryptor {
-    /// Create decryptor for one layer
-    pub fn new(key: [u8; KEY_SIZE]) -> Result<Self> {
-        Ok(Self {
-            layer: OnionLayer::from_key(key)?,
-        })
-    }
+/// ML-DSA-87 detached signature.
+pub fn sign(
+    sk: &[u8],
+    msg: &[u8],
+    sig_out: &mut [u8; 4627],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
 
-    /// Decrypt one onion layer
-    pub fn decrypt(&self, packet: &[u8]) -> Result<Box<[u8]>> {
-        self.layer.decrypt(packet)
-    }
+    let len_ok = sk.len() == pqc::DSA_SK_SIZE;
+    let mut sk_buf = [0u8; pqc::DSA_SK_SIZE];
+    ct_copy_if(len_ok, sk, &mut sk_buf);
+
+    let op = pqc::dsa_sign_into(&sk_buf, msg, sig_out).map_err(|_| "sign failed");
+    let result = if len_ok {
+        op
+    } else {
+        zeroize_array(sig_out);
+        Err("sign failed")
+    };
+
+    zeroize_array(&mut sk_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_SIGN_NS);
+    result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// SHA-512 digest.
+pub fn hash(data: &[u8]) -> [u8; 64] {
+    let start = Instant::now();
+    let digest = crate::algos::sha512::hash(data);
+    enforce_public_floor(start, FLOOR_PUBLIC_HASH_NS);
+    digest
+}
 
-    #[test]
-    fn test_onion_roundtrip() {
-        let plaintext = b"Test message";
-        let encryptor = OnionEncryptor::new(
-            [1u8; KEY_SIZE],
-            [2u8; KEY_SIZE],
-            [3u8; KEY_SIZE],
-        )
-        .expect("Failed to create encryptor");
+/// Constant-time byte-slice equality comparison.
+pub fn compare(a: &[u8], b: &[u8]) -> bool {
+    let start = Instant::now();
+    let eq = ct_eq(a, b);
+    enforce_public_floor(start, FLOOR_PUBLIC_COMPARE_NS);
+    eq
+}
 
-        let encrypted = encryptor.encrypt(plaintext).expect("Encryption failed");
+/// Apply exactly 3 hybrid layers (ML-KEM + AES-GCM + ML-DSA).
+pub fn layer_encrypt(
+    plaintext: &[u8],
+    kem_pks: [&[u8]; 3],
+    dsa_sks: [&[u8]; 3],
+    out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+    let result = onion_internal_into(plaintext, &kem_pks, &dsa_sks, out)
+        .map_err(|_| "layer encryption failed");
+    enforce_public_floor(start, FLOOR_PUBLIC_LAYER_NS);
+    result
+}
 
-        // Decrypt each layer
-        let dec1 = OnionDecryptor::new([1u8; KEY_SIZE]).expect("Dec1 failed");
-        let layer1 = dec1.decrypt(&encrypted).expect("Layer1 decrypt failed");
-
-        let dec2 = OnionDecryptor::new([2u8; KEY_SIZE]).expect("Dec2 failed");
-        let layer2 = dec2.decrypt(&layer1).expect("Layer2 decrypt failed");
-
-        let dec3 = OnionDecryptor::new([3u8; KEY_SIZE]).expect("Dec3 failed");
-        let decrypted = dec3.decrypt(&layer2).expect("Layer3 decrypt failed");
-
-        assert_eq!(&decrypted[..], plaintext);
-    }
-
-    #[test]
-    fn test_tampering_detection() {
-        let layer = OnionLayer::from_key([0x42u8; KEY_SIZE]).expect("Layer creation failed");
-        let mut encrypted = layer.encrypt(b"Original").expect("Encryption failed").to_vec();
-
-        // Tamper with ciphertext
-        encrypted[15] ^= 0x01;
-
-        // Decryption should fail due to authentication tag mismatch
-        let result = layer.decrypt(&encrypted);
-        assert!(result.is_err());
-        
-        if let Err(e) = result {
-            assert_eq!(e.kind(), &CryptoErrorKind::DecryptionFailed);
-            assert_eq!(e.stride_category(), &StrideCategory::Tampering);
-        }
-    }
-
-    #[test]
-    fn test_invalid_packet_size() {
-        let layer = OnionLayer::from_key([0x99u8; KEY_SIZE]).expect("Layer creation failed");
-        let too_small = vec![0u8; 10]; // Less than MIN_PACKET_SIZE
-
-        let result = layer.decrypt(&too_small);
-        assert!(result.is_err());
-        
-        if let Err(e) = result {
-            assert_eq!(e.kind(), &CryptoErrorKind::InvalidPacket);
-        }
-    }
-
-    #[test]
-    fn test_audit_metrics_increment() {
-        use std::sync::atomic::Ordering;
-        
-        let initial = METRICS.total_operations.load(Ordering::Relaxed);
-        
-        let layer = OnionLayer::from_key([0xAAu8; KEY_SIZE]).expect("Layer creation failed");
-        let _encrypted = layer.encrypt(b"Test");
-        
-        let after = METRICS.total_operations.load(Ordering::Relaxed);
-        assert!(after > initial);
-    }
+/// Apply N hybrid onion layers (N is user-defined).
+pub fn onion(
+    plaintext: &[u8],
+    kem_pks: &[&[u8]],
+    dsa_sks: &[&[u8]],
+    out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+    let result = onion_internal_into(plaintext, kem_pks, dsa_sks, out)
+        .map_err(|_| "onion encryption failed");
+    enforce_public_floor(start, FLOOR_PUBLIC_ONION_NS);
+    result
 }

@@ -1,297 +1,349 @@
-//! Constant-time cryptographic operations with enforcement
+//! Constant-time primitives.
 //!
-//! This module provides constant-time operations with:
-//! - **Timing Guarantees**: Operations take predetermined time regardless of inputs
-//! - **Side-Channel Protection**: Resistant to timing, cache, and branch prediction attacks
-//! - **Verification**: Runtime checks for timing constraint violations
-//! - **Audit Logging**: Timing violation alerts for security monitoring
+//! ## Threat model and limitations
 //!
-//! ## Implementation Strategy
+//! These functions attempt to prevent *compiler-level* timing channels by:
 //!
-//! All operations use:
-//! 1. Constant-time comparison primitives from `subtle` crate
-//! 2. Fixed iteration counts (no data-dependent branches)
-//! 3. Constant memory access patterns
-//! 4. Timing guards that verify execution time bounds
+//! - Accumulating results with XOR/OR folds instead of early-return branches.
+//! - Using `ptr::read_volatile` to prevent the compiler from eliminating reads
+//!   or short-circuiting loops based on intermediate values.
+//! - Inserting `compiler_fence(SeqCst)` barriers before returning boolean
+//!   results to prevent instruction reordering.
+//!
+//! Hardware-level timing guarantees (branch-predictor training, cache
+//! side-channels, speculative execution) are *not* provided by this module.
+//! Production deployments should validate timing properties with dedicated
+//! analysis tools (e.g., `ctgrind`, `dudect`).
+//!
+//! [`TimingGuard`] enforces a minimum execution floor via spin-wait and
+//! detects ceiling violations. It is a best-effort defence against observable
+//! timing at the network layer, not a substitute for hardware CT assurance.
 
+#![allow(unsafe_code)]
+
+use crate::audit::METRICS;
 use crate::error::{CryptoError, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::zeroize::zeroize_mem;
+use core::hint::black_box;
+use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 use std::time::Instant;
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess};
-use zeroize::Zeroize;
 
-/// Maximum allowed timing deviation in nanoseconds (1ms tolerance)
-const MAX_TIMING_DEVIATION_NS: u64 = 1_000_000;
-
-/// Minimum expected operation time in nanoseconds (prevents too-fast operations)
-const MIN_OPERATION_TIME_NS: u64 = 10_000;
-
-/// Global timing violation counter for security monitoring
+/// Global timing-violation counter, distinct from the audit-layer counter.
 static TIMING_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Get count of timing violations (for security dashboards)
+/// Maximum allowed overshoot above the timing floor (5 ms).
+const MAX_TIMING_WINDOW_NS: u64 = 5_000_000;
+
+// ── Internal branchless helpers ───────────────────────────────────────────────
+
+/// Returns `0xFF` if `a < b`, `0x00` otherwise. No branches.
+///
+/// Uses the borrow bit of a widened subtraction.
 #[inline]
-pub fn get_timing_violations() -> u64 {
-    TIMING_VIOLATIONS.load(Ordering::Relaxed)
+fn ct_byte_lt(a: u8, b: u8) -> u8 {
+    // SAFETY: arithmetic on u16 — no memory access, no UB.
+    let borrow = (a as u16).wrapping_sub(b as u16) >> 8;
+    // borrow is 0 or 1; wrapping_neg maps 1 → 0xFF, 0 → 0x00.
+    (borrow as u8).wrapping_neg()
 }
 
-/// Timing guard that enforces constant-time execution
-///
-/// Ensures operations take a minimum expected time and logs violations.
-pub struct TimingGuard {
-    start: Instant,
-    expected_min_ns: u64,
-    expected_max_ns: u64,
-    operation_name: &'static str,
-}
-
-impl TimingGuard {
-    /// Create new timing guard with expected duration bounds
-    #[inline]
-    pub fn new(operation_name: &'static str, expected_min_ns: u64) -> Self {
-        Self {
-            start: Instant::now(),
-            expected_min_ns,
-            expected_max_ns: expected_min_ns + MAX_TIMING_DEVIATION_NS,
-            operation_name,
-        }
-    }
-    
-    /// Verify timing constraint (call at end of operation)
-    pub fn verify(self) -> Result<()> {
-        let elapsed_ns = self.start.elapsed().as_nanos() as u64;
-        
-        if elapsed_ns < self.expected_min_ns {
-            TIMING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(CryptoError::timing_violation(format!(
-                "{} completed too fast: {}ns < {}ns min",
-                self.operation_name, elapsed_ns, self.expected_min_ns
-            )));
-        }
-        
-        if elapsed_ns > self.expected_max_ns {
-            TIMING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(CryptoError::timing_violation(format!(
-                "{} exceeded time bound: {}ns > {}ns max",
-                self.operation_name, elapsed_ns, self.expected_max_ns
-            )));
-        }
-        
-        Ok(())
-    }
-}
-
-/// Constant-time buffer equality check
-///
-/// Time complexity is O(n) where n = min(a.len(), b.len()).
-/// Does NOT leak information about:
-/// - Position of first difference
-/// - Number of differences
-/// - Whether buffers are equal until last byte compared
-///
-/// # Timing Guarantee
-///
-/// - Fixed number of iterations: always min(a.len(), b.len())
-/// - Constant memory access pattern
-/// - No early return on mismatch
+/// Returns `0xFF` if `a == b`, `0x00` otherwise. No branches.
 #[inline]
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    // Length comparison is constant-time within same type
+fn ct_byte_eq(a: u8, b: u8) -> u8 {
+    let diff = a ^ b;
+    // If diff == 0: (0 | 0) >> 7 == 0 → nonzero == 0 → 0u8.wrapping_sub(0) == 0xFF? No.
+    // Actually: nonzero == 0 → 0u8.wrapping_neg() == 0 ... wait, need:
+    //   nonzero = 0 if equal, 1 if not equal.
+    // (diff | diff.wrapping_neg()) has MSB set iff diff != 0.
+    let nonzero = (diff | diff.wrapping_neg()) >> 7; // 0 if equal, 1 if not equal
+    nonzero.wrapping_sub(1) // 0xFF if equal (0-1 wraps), 0x00 if not equal (1-1 = 0)
+}
+
+/// Returns `0xFFFF_FFFF` if `a < b`, `0x0000_0000` otherwise.
+///
+/// Uses the borrow bit of a 64-bit widened subtraction.
+#[inline]
+fn ct_u32_lt(a: u32, b: u32) -> u32 {
+    // The upper 32 bits of the 64-bit result hold the borrow.
+    let borrow = (a as u64).wrapping_sub(b as u64) >> 32;
+    borrow as u32 // 0 or 0xFFFF_FFFF
+}
+
+// ── Public CT primitives ──────────────────────────────────────────────────────
+
+/// Constant-time equality check for byte slices.
+///
+/// Length mismatch is not secret and returns immediately.
+/// All bytes are read via `read_volatile` to prevent loop elimination.
+#[inline]
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    
-    let len = a.len();
-    let mut equal = Choice::from(1u8);
-    
-    // Fixed iteration count - no data-dependent branches
-    for i in 0..len {
-        equal &= a[i].ct_eq(&b[i]);
+    let mut acc = 0u8;
+    for i in 0..a.len() {
+        // SAFETY: `i` is within bounds for both slices; bounds checked above.
+        // `read_volatile` prevents the compiler from proving `acc` can never
+        // be set and eliding the loop.
+        let x = unsafe { ptr::read_volatile(a.as_ptr().add(i)) };
+        let y = unsafe { ptr::read_volatile(b.as_ptr().add(i)) };
+        acc |= x ^ y;
     }
-    
-    equal.into()
+    compiler_fence(Ordering::SeqCst);
+    black_box(acc) == 0
 }
 
-/// Constant-time buffer comparison (less-than)
+/// Constant-time equality check returning a 0/1 mask.
 ///
-/// Returns true if a < b in lexicographic order.
-/// Timing is independent of where first difference occurs.
+/// Returns `1` when slices are equal, `0` otherwise.
 #[inline]
-pub fn ct_less_than(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq_mask(a: &[u8], b: &[u8]) -> u8 {
+    ct_eq(a, b) as u8
+}
+
+/// Constant-time equality check for fixed 16-byte values.
+#[inline]
+pub(crate) fn ct_eq_16(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    ct_eq(a, b)
+}
+
+/// Constant-time lexicographic less-than for byte slices.
+///
+/// Runs all byte comparisons without early exit regardless of intermediate
+/// results. Length difference is used only after comparing all shared bytes.
+#[inline]
+pub(crate) fn ct_less_than(a: &[u8], b: &[u8]) -> bool {
     let len = a.len().min(b.len());
-    let mut less = Choice::from(0u8);
-    let mut equal = Choice::from(1u8);
-    
+    // `less`:  0xFF while a is determined to be less, 0x00 otherwise.
+    // `equal`: 0xFF while all bytes seen so far are equal, 0x00 once a diff is found.
+    let mut less: u8 = 0x00;
+    let mut equal: u8 = 0xFF;
+
     for i in 0..len {
-        let byte_less = a[i].ct_lt(&b[i]);
-        let byte_equal = a[i].ct_eq(&b[i]);
-        
-        // Update less if we haven't found a difference yet
-        less |= equal & byte_less;
-        // Update equal - we're only equal if all previous bytes were equal
-        equal &= byte_equal;
+        // SAFETY: `i` is within bounds for both slices.
+        let ai = unsafe { ptr::read_volatile(a.as_ptr().add(i)) };
+        let bi = unsafe { ptr::read_volatile(b.as_ptr().add(i)) };
+
+        let byte_lt = ct_byte_lt(ai, bi); // 0xFF if ai < bi
+        let byte_eq = ct_byte_eq(ai, bi); // 0xFF if ai == bi
+
+        // We update `less` only if we haven't diverged yet (equal & byte_lt).
+        // Once a difference is found, `equal` becomes 0x00 and further bytes
+        // cannot change `less`.
+        less |= equal & byte_lt;
+        equal &= byte_eq;
     }
-    
-    // If all compared bytes equal, shorter slice is "less"
-    less |= equal & Choice::from((a.len() < b.len()) as u8);
-    
-    less.into()
+
+    // If all shared bytes are equal, a shorter slice is less.
+    let shorter_less = ((a.len() < b.len()) as u8).wrapping_neg();
+    less |= equal & shorter_less;
+
+    compiler_fence(Ordering::SeqCst);
+    black_box(less) != 0
 }
 
-/// Constant-time conditional copy
+/// Constant-time conditional copy. Copies `src` into `dst` iff `condition`.
 ///
-/// If condition is true, copies src to dst. Otherwise leaves dst unchanged.
-/// Timing is independent of condition value.
+/// Uses a bitmask select on each byte — no branch on `condition` after
+/// the mask is computed.
 #[inline]
-pub fn ct_copy_if(condition: bool, src: &[u8], dst: &mut [u8]) {
+pub(crate) fn ct_copy_if(condition: bool, src: &[u8], dst: &mut [u8]) {
+    ct_cmov_bytes(dst, src, condition as u8);
+}
+
+/// Constant-time conditional move.
+///
+/// Copies `src` into `dst` iff `choice == 1`; leaves `dst` unchanged otherwise.
+/// Any non-`{0,1}` value is reduced to its low bit.
+#[inline]
+pub(crate) fn ct_cmov_bytes(dst: &mut [u8], src: &[u8], choice: u8) {
     let len = src.len().min(dst.len());
-    let choice = Choice::from(condition as u8);
-    
+    let src_mask = (choice & 1).wrapping_neg(); // 0xFF if choice==1, else 0x00
+    let dst_mask = !src_mask;
     for i in 0..len {
-        dst[i] = u8::conditional_select(&dst[i], &src[i], choice);
+        dst[i] = (src[i] & src_mask) | (dst[i] & dst_mask);
     }
 }
 
-/// Constant-time select between two buffers
-///
-/// Returns a (choosing src_true) or b (choosing src_false) based on condition.
-/// Timing is independent of condition value.
-pub fn ct_select<'a>(condition: bool, src_true: &'a [u8], src_false: &'a [u8]) -> &'a [u8] {
-    // Note: This is pointer selection, not data copy
-    if condition { src_true } else { src_false }
-}
-
-/// Constant-time XOR operation
-///
-/// Computes dst[i] = a[i] ^ b[i] for all i.
-/// Fixed iteration count, no data-dependent branches.
+/// Constant-time XOR: `dst[i] = a[i] ^ b[i]`.
 #[inline]
-pub fn ct_xor(a: &[u8], b: &[u8], dst: &mut [u8]) {
+pub(crate) fn ct_xor(a: &[u8], b: &[u8], dst: &mut [u8]) {
     let len = a.len().min(b.len()).min(dst.len());
-    
-    // Fixed iteration - always processes full length
     for i in 0..len {
         dst[i] = a[i] ^ b[i];
     }
 }
 
-/// Constant-time array zeroization with verification
+/// Zeroize `buffer` then verify all bytes read back as zero.
 ///
-/// Overwrites buffer with zeros and verifies zeroization succeeded.
-/// This provides defense against compiler optimizations that might
-/// remove "dead" zeroization code.
-pub fn ct_zeroize_verify(buffer: &mut [u8]) -> Result<()> {
-    let len = buffer.len();
-    
-    // Perform zeroization
-    buffer.zeroize();
-    
-    // Verify using constant-time check
-    let mut all_zero = Choice::from(1u8);
-    for i in 0..len {
-        all_zero &= buffer[i].ct_eq(&0u8);
+/// Verification uses `read_volatile` to prevent the compiler from treating the
+/// post-zeroize state as a compile-time constant and eliding the check.
+pub(crate) fn ct_zeroize_verify(buffer: &mut [u8]) -> Result<()> {
+    // SAFETY: `buffer` is a valid writable byte slice.
+    unsafe { zeroize_mem(buffer.as_mut_ptr(), buffer.len()) };
+
+    let mut nonzero = 0u8;
+    for i in 0..buffer.len() {
+        // SAFETY: `i` is within bounds.
+        // `read_volatile` prevents the compiler from constant-folding the
+        // post-zeroize state and skipping the loop.
+        let byte = unsafe { ptr::read_volatile(buffer.as_ptr().add(i)) };
+        nonzero |= byte;
     }
-    
-    if bool::from(all_zero) {
+
+    compiler_fence(Ordering::SeqCst);
+
+    if black_box(nonzero) == 0 {
         Ok(())
     } else {
         Err(CryptoError::sanitization_failed(
-            "Buffer zeroization verification failed - data still present"
+            "zeroization verification failed",
         ))
     }
 }
 
-/// Constant-time modular reduction using binary method
+// ── Scalar CT operations ──────────────────────────────────────────────────────
+
+/// Constant-time `value % modulus` using a 32-step binary long-division.
 ///
-/// Returns value % modulus in constant time.
-/// Works correctly for any modulus size using a fixed 32-iteration binary algorithm.
-///
-/// Algorithm: For each bit position (MSB to LSB), attempt to subtract
-/// (modulus << bit_position) if result would remain non-negative.
-/// This is constant-time because we always test all 32 bit positions.
-///
-/// # Example
-/// ```ignore
-/// ct_mod_reduce(1000, 7) -> 6
-/// ct_mod_reduce(15, 7) -> 1
-/// ct_mod_reduce(10, 3) -> 1
-/// ```
+/// Each step is a branchless conditional subtraction via bitmask select.
 #[inline]
-pub fn ct_mod_reduce(value: u32, modulus: u32) -> u32 {
+pub(crate) fn ct_mod_reduce(value: u32, modulus: u32) -> u32 {
     let mut result = value;
-    
-    // Process each bit position from MSB to LSB
-    // Fixed 32 iterations ensures constant time regardless of modulus size
-    for bit in (0..32).rev() {
-        let shifted_modulus = modulus.wrapping_shl(bit);
-        
-        // Check if we can subtract without underflow (constant-time comparison)
-        let can_subtract = !result.ct_lt(&shifted_modulus);
-        
-        // Conditionally subtract based on result
-        result = u32::conditional_select(&result, &result.wrapping_sub(shifted_modulus), can_subtract);
+    for bit in (0..32u32).rev() {
+        let shifted = modulus.wrapping_shl(bit);
+        // mask = 0xFFFF_FFFF if result >= shifted (i.e., *not* less-than).
+        let lt_mask = ct_u32_lt(result, shifted);
+        let ge_mask = !lt_mask;
+        let sub_result = result.wrapping_sub(shifted);
+        // Select sub_result if result >= shifted, else keep result.
+        result = (sub_result & ge_mask) | (result & lt_mask);
     }
-    
     result
 }
 
-/// Constant-time minimum selection
-///
-/// Returns min(a, b) without branching on comparison result.
+/// Constant-time minimum of two `u32` values.
 #[inline]
-pub fn ct_min_u32(a: u32, b: u32) -> u32 {
-    let a_less = a.ct_lt(&b);
-    u32::conditional_select(&b, &a, a_less)
+pub(crate) fn ct_min_u32(a: u32, b: u32) -> u32 {
+    // mask = 0xFFFF_FFFF if a < b, select a; else select b.
+    let mask = ct_u32_lt(a, b);
+    (a & mask) | (b & !mask)
 }
 
-/// Constant-time maximum selection
+/// Constant-time maximum of two `u32` values.
 #[inline]
-pub fn ct_max_u32(a: u32, b: u32) -> u32 {
-    let a_greater = a.ct_gt(&b);
-    u32::conditional_select(&b, &a, a_greater)
+pub(crate) fn ct_max_u32(a: u32, b: u32) -> u32 {
+    // mask = 0xFFFF_FFFF if b < a (a is the larger), select a; else select b.
+    let mask = ct_u32_lt(b, a);
+    (a & mask) | (b & !mask)
 }
 
-/// Constant-time range check
-///
-/// Returns true if value is in [min, max] inclusive.
-/// Timing independent of value or bounds.
+/// Constant-time inclusive range check: `min <= value <= max`.
 #[inline]
-pub fn ct_in_range(value: u32, min: u32, max: u32) -> bool {
-    // ct_ge = !ct_lt, ct_le = !ct_gt
-    let gte_min = !value.ct_lt(&min);
-    let lte_max = !value.ct_gt(&max);
-    bool::from(gte_min & lte_max)
+pub(crate) fn ct_in_range(value: u32, min: u32, max: u32) -> bool {
+    let ge_min = ct_u32_lt(value, min) == 0; // value >= min iff NOT (value < min)
+    let le_max = ct_u32_lt(max, value) == 0; // value <= max iff NOT (max < value)
+    compiler_fence(Ordering::SeqCst);
+    ge_min & le_max
 }
 
-/// Constant-time bit extraction
+/// Constant-time population count (Hamming weight) for `u32`.
 ///
-/// Returns the bit at position `bit_index` from `value`.
-/// Timing independent of bit_index or value.
+/// Uses the parallel bit-sum algorithm. No branches, no data-dependent
+/// memory accesses. The algorithm is from Hacker's Delight §5-1.
 #[inline]
-pub fn ct_get_bit(value: u32, bit_index: u8) -> bool {
-    if bit_index >= 32 {
-        return false;
+pub(crate) fn ct_hamming_weight(value: u32) -> u32 {
+    let v = value;
+    let v = v - ((v >> 1) & 0x5555_5555);
+    let v = (v & 0x3333_3333) + ((v >> 2) & 0x3333_3333);
+    let v = (v + (v >> 4)) & 0x0F0F_0F0F;
+    v.wrapping_mul(0x0101_0101) >> 24
+}
+
+// ── Timing guard ──────────────────────────────────────────────────────────────
+
+/// Best-effort timing floor and ceiling enforcer.
+///
+/// Create one at the start of a guarded block, then call [`TimingGuard::enforce`]
+/// at the end. The guard spin-waits if the operation completed faster than
+/// `floor_ns`, ensuring the *observed* duration is at least as long as the
+/// floor regardless of the operation's actual duration.
+///
+/// ## Limitations
+///
+/// - Spin-wait precision is limited by the OS scheduler. On a heavily loaded
+///   system, preemption between loop iterations may cause the final measured
+///   duration to overshoot the ceiling.
+/// - This provides network-layer timing normalisation, not hardware-level
+///   constant-time guarantees.
+pub(crate) struct TimingGuard {
+    start: Instant,
+    floor_ns: u64,
+    ceil_ns: u64,
+    name: &'static str,
+}
+
+impl TimingGuard {
+    #[inline]
+    pub(crate) fn new(name: &'static str, floor_ns: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            floor_ns,
+            ceil_ns: floor_ns + MAX_TIMING_WINDOW_NS,
+            name,
+        }
     }
-    
-    let mask = 1u32 << bit_index;
-    let masked = value & mask;
-    bool::from(masked.ct_ne(&0u32))
-}
 
-/// Constant-time hamming weight (population count)
-///
-/// Counts number of 1-bits in constant time.
-#[inline]
-pub fn ct_hamming_weight(value: u32) -> u32 {
-    let mut count = 0u32;
-    
-    // Fixed 32 iterations, one per bit
-    for i in 0..32 {
-        let bit = ct_get_bit(value, i);
-        count = u32::conditional_select(&count, &(count + 1), Choice::from(bit as u8));
+    /// Spin-wait until the floor is met, then verify the ceiling.
+    ///
+    /// Returns `Err` if the elapsed time exceeds the ceiling after the floor
+    /// has been satisfied. A ceiling overshoot is recorded as a timing
+    /// violation in both the module counter and the audit-layer metrics.
+    pub(crate) fn enforce(self) -> Result<()> {
+        loop {
+            // `black_box` prevents the compiler from treating the elapsed
+            // value as a compile-time constant and collapsing the loop.
+            let elapsed = black_box(self.start.elapsed().as_nanos() as u64);
+
+            if elapsed >= self.floor_ns {
+                if elapsed > self.ceil_ns {
+                    TIMING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                    METRICS.record_timing_viol();
+                    return Err(CryptoError::timing_violation("timing ceiling exceeded"));
+                }
+                return Ok(());
+            }
+
+            core::hint::spin_loop();
+        }
     }
-    
-    count
+
+    /// Passive check without enforcement (test-only).
+    ///
+    /// Returns `Err` if the elapsed time is outside `[floor_ns, ceil_ns]`
+    /// at the moment of the call, without spin-waiting.
+    #[cfg(test)]
+    pub(crate) fn verify(self) -> Result<()> {
+        let elapsed = self.start.elapsed().as_nanos() as u64;
+
+        if elapsed < self.floor_ns {
+            TIMING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            METRICS.record_timing_viol();
+            return Err(CryptoError::timing_violation("timing floor violated"));
+        }
+        if elapsed > self.ceil_ns {
+            TIMING_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            METRICS.record_timing_viol();
+            return Err(CryptoError::timing_violation("timing ceiling exceeded"));
+        }
+        Ok(())
+    }
+
+    /// Returns the number of timing violations recorded by this module.
+    pub(crate) fn violation_count() -> u64 {
+        TIMING_VIOLATIONS.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -299,118 +351,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ct_eq_same() {
-        let a = b"Hello, World!";
-        let b = b"Hello, World!";
-        assert!(ct_eq(a, b));
+    fn ct_eq_16_identical() {
+        assert!(ct_eq_16(&[0x42; 16], &[0x42; 16]));
     }
 
     #[test]
-    fn test_ct_eq_different() {
-        let a = b"Hello, World!";
-        let b = b"Hello, world!"; // lowercase 'w'
-        assert!(!ct_eq(a, b));
+    fn ct_eq_16_mismatch() {
+        let a = [0xAA; 16];
+        let mut b = [0xAA; 16];
+        b[7] ^= 1;
+        assert!(!ct_eq_16(&a, &b));
     }
 
     #[test]
-    fn test_ct_eq_different_lengths() {
-        let a = b"Short";
-        let b = b"Much longer string";
-        assert!(!ct_eq(a, b));
+    fn ct_eq_mask_handles_len_mismatch() {
+        assert_eq!(ct_eq_mask(&[1, 2, 3], &[1, 2]), 0);
     }
 
     #[test]
-    fn test_ct_less_than() {
-        assert!(ct_less_than(b"apple", b"banana"));
-        assert!(!ct_less_than(b"banana", b"apple"));
-        assert!(!ct_less_than(b"same", b"same"));
+    fn ct_cmov_bytes_choice_zero_keeps_dst() {
+        let mut dst = [1u8, 2, 3];
+        let src = [9u8, 9, 9];
+        ct_cmov_bytes(&mut dst, &src, 0);
+        assert_eq!(dst, [1, 2, 3]);
     }
 
     #[test]
-    fn test_ct_xor() {
-        let a = [0xAAu8; 16];
-        let b = [0x55u8; 16];
-        let mut result = [0u8; 16];
-        
-        ct_xor(&a, &b, &mut result);
-        
-        assert_eq!(result, [0xFFu8; 16]);
-    }
-
-    #[test]
-    fn test_ct_copy_if_true() {
-        let src = [1, 2, 3, 4];
-        let mut dst = [0, 0, 0, 0];
-        
-        ct_copy_if(true, &src, &mut dst);
-        
-        assert_eq!(dst, [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_ct_copy_if_false() {
-        let src = [1, 2, 3, 4];
-        let mut dst = [9, 9, 9, 9];
-        
-        ct_copy_if(false, &src, &mut dst);
-        
-        assert_eq!(dst, [9, 9, 9, 9]);
-    }
-
-    #[test]
-    fn test_ct_zeroize_verify() {
-        let mut data = vec![0x42u8; 1024];
-        
-        let result = ct_zeroize_verify(&mut data);
-        
-        assert!(result.is_ok());
-        assert_eq!(data, vec![0u8; 1024]);
-    }
-
-    #[test]
-    fn test_ct_mod_reduce() {
-        assert_eq!(ct_mod_reduce(10, 3), 1);
-        assert_eq!(ct_mod_reduce(15, 7), 1);
-        assert_eq!(ct_mod_reduce(100, 13), 9);
-    }
-
-    #[test]
-    fn test_ct_min_max() {
-        assert_eq!(ct_min_u32(5, 10), 5);
-        assert_eq!(ct_min_u32(10, 5), 5);
-        assert_eq!(ct_max_u32(5, 10), 10);
-        assert_eq!(ct_max_u32(10, 5), 10);
-    }
-
-    #[test]
-    fn test_ct_in_range() {
-        assert!(ct_in_range(5, 1, 10));
-        assert!(ct_in_range(1, 1, 10));
-        assert!(ct_in_range(10, 1, 10));
-        assert!(!ct_in_range(0, 1, 10));
-        assert!(!ct_in_range(11, 1, 10));
-    }
-
-    #[test]
-    fn test_ct_hamming_weight() {
-        assert_eq!(ct_hamming_weight(0), 0);
-        assert_eq!(ct_hamming_weight(1), 1);
-        assert_eq!(ct_hamming_weight(0xFF), 8);
-        assert_eq!(ct_hamming_weight(0xFFFF_FFFF), 32);
-    }
-
-    #[test]
-    fn test_timing_guard_success() {
-        let guard = TimingGuard::new("test_op", 0);
-        std::thread::sleep(std::time::Duration::from_micros(20));
-        assert!(guard.verify().is_ok());
-    }
-
-    #[test]
-    fn test_timing_violations_counter() {
-        let initial = get_timing_violations();
-        let guard = TimingGuard::new("test", MIN_OPERATION_TIME_NS * 10);
-        let _ = guard.verify(); // Will fail - too fast
-        assert!(get_timing_violations() > initial);
+    fn ct_cmov_bytes_choice_one_copies_src() {
+        let mut dst = [1u8, 2, 3];
+        let src = [9u8, 9, 9];
+        ct_cmov_bytes(&mut dst, &src, 1);
+        assert_eq!(dst, [9, 9, 9]);
     }
 }

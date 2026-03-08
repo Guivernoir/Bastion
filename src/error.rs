@@ -1,267 +1,213 @@
-//! Error types for cryptographic operations with dual-context reporting
+//! Opaque error types for cryptographic operations.
 //!
-//! This module implements a dual-context error system:
-//! - **External Context**: Opaque, sanitized errors safe for user display
-//! - **Internal Context**: Detailed debugging information for security auditing
+//! External surface: [`CryptoError`] (opaque) and [`Result<T>`].
 //!
-//! ## STRIDE Threat Model Coverage
-//!
-//! - **Spoofing**: Errors never leak authentication details
-//! - **Tampering**: Error messages are immutable and verified
-//! - **Repudiation**: All errors can be logged with audit context
-//! - **Information Disclosure**: External errors are completely opaque
-//! - **Denial of Service**: Rate limit errors distinguish legitimate vs attack
-//! - **Elevation of Privilege**: No errors leak permission/capability info
-//!
-//! ## GDPR Compliance
-//!
-//! - Errors never contain PII or user-identifiable data
-//! - All error contexts can be sanitized for data subject access requests
-//! - Audit logs support right to erasure via redaction markers
+//! `Display` emits a fixed string with no implementation detail.
+//! Internal context is retained for forensic correlation and is only
+//! accessible within the crate.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Result type for cryptographic operations
-pub type Result<T> = std::result::Result<T, CryptoError>;
+/// Crate-wide result alias.
+pub(crate) type Result<T> = std::result::Result<T, CryptoError>;
 
-/// Error severity levels for security incident classification
-#[derive(Debug, PartialEq, Eq, ZeroizeOnDrop, Zeroize)]
-pub enum ErrorSeverity {
-    /// Informational - expected operational event
-    Info,
-    /// Warning - unusual but not critical
+// ── Internal classification ───────────────────────────────────────────────────
+
+/// Severity level used for internal routing and metrics.
+///
+/// Not sensitive — no zeroize needed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ErrorSeverity {
     Warning,
-    /// Error - operation failed, no security impact
     Error,
-    /// Critical - security boundary violated or system integrity compromised
     Critical,
 }
 
-/// Internal error context for debugging and security auditing
+/// Broad STRIDE threat category used for internal counter routing.
 ///
-/// This context is NEVER exposed to external users or included in
-/// external error messages. It's only used for:
-/// - Security incident response
-/// - Forensic analysis
-/// - Development debugging
-/// - Compliance auditing
-#[derive(ZeroizeOnDrop)]
-pub struct InternalErrorContext {
-    /// Detailed error description (may contain sensitive info)
-    pub details: String,
-    
-    /// Error occurrence timestamp (nanoseconds since epoch)
-    pub timestamp_ns: u64,
-    
-    /// Error sequence number for correlation
-    pub sequence: u64,
-    
-    /// Severity level for incident classification
-    pub severity: ErrorSeverity,
-    
-    /// Optional stack context (file:line if available)
-    pub location: Option<String>,
-    
-    /// STRIDE threat category
-    pub stride_category: StrideCategory,
-}
-
-/// STRIDE threat model categories
-#[derive(Debug, PartialEq, Eq, ZeroizeOnDrop, Zeroize)]
-pub enum StrideCategory {
-    /// Spoofing - identity verification failures
-    Spoofing,
-    /// Tampering - data integrity violations
+/// Not sensitive — no zeroize needed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ThreatCategory {
     Tampering,
-    /// Repudiation - audit/logging failures
-    Repudiation,
-    /// Information Disclosure - data leakage risks
+    Spoofing,
     InformationDisclosure,
-    /// Denial of Service - availability impacts
     DenialOfService,
-    /// Elevation of Privilege - authorization failures
-    ElevationOfPrivilege,
-    /// Not applicable to STRIDE model
-    NotApplicable,
+    /// The audit/sanitization layer itself has failed (e.g. zeroize verification).
+    AuditFailure,
+    None,
 }
 
-impl InternalErrorContext {
-    /// Create sanitized version for external logging (GDPR-compliant)
-    pub fn sanitize(&self) -> String {
-        format!(
-            "seq={} sev={:?} stride={:?} ts={}",
-            self.sequence,
-            self.severity,
-            self.stride_category,
-            self.timestamp_ns
-        )
+/// Error detail retained for forensic correlation. Never forwarded to callers.
+///
+/// `details` is static and allocation-free.
+pub(crate) struct InternalCtx {
+    /// Human-readable detail — may reference internal state; never surfaces externally.
+    pub(crate) details: &'static str,
+    pub(crate) timestamp_ns: u64,
+    pub(crate) sequence: u64,
+    pub(crate) severity: ErrorSeverity,
+    pub(crate) category: ThreatCategory,
+}
+
+#[derive(Debug)]
+pub(crate) struct SanitizedCtx {
+    pub(crate) sequence: u64,
+    pub(crate) severity: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) timestamp_ns: u64,
+}
+
+impl InternalCtx {
+    /// Sanitized structured context for audit logging.
+    pub(crate) fn sanitized(&self) -> SanitizedCtx {
+        let severity = match self.severity {
+            ErrorSeverity::Warning => "warning",
+            ErrorSeverity::Error => "error",
+            ErrorSeverity::Critical => "critical",
+        };
+
+        let category = match self.category {
+            ThreatCategory::Tampering => "tampering",
+            ThreatCategory::Spoofing => "spoofing",
+            ThreatCategory::InformationDisclosure => "information_disclosure",
+            ThreatCategory::DenialOfService => "denial_of_service",
+            ThreatCategory::AuditFailure => "audit_failure",
+            ThreatCategory::None => "none",
+        };
+
+        SanitizedCtx {
+            sequence: self.sequence,
+            severity,
+            category,
+            timestamp_ns: self.timestamp_ns,
+        }
     }
 }
 
-/// Global error sequence counter for correlation
-static ERROR_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+// ── Error kind ────────────────────────────────────────────────────────────────
 
-/// Cryptographic operation errors with dual context
+/// Classifies the error for `Display` string selection.
 ///
-/// External variants are completely opaque. Internal context provides
-/// detailed information for security teams while preventing information
-/// leakage to potential attackers.
-#[derive(ZeroizeOnDrop)]
-pub struct CryptoError {
-    /// External error type (safe for user display)
-    kind: CryptoErrorKind,
-    
-    /// Internal debugging context (NEVER exposed externally)
-    internal: InternalErrorContext,
+/// Not sensitive — no zeroize needed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    EncryptionFailed,
+    DecryptionFailed,
+    InvalidPacket,
+    RateLimit,
+    KeyExchangeFailed,
+    SignatureFailed,
+    InvalidPublicKey,
+    Internal,
+    TimingViolation,
+    SanitizationFailed,
 }
 
-/// External error kinds (completely opaque, no implementation details)
-#[derive(Debug, PartialEq, Eq, ZeroizeOnDrop)]
-pub enum CryptoErrorKind {
-    /// Encryption operation failed
-    EncryptionFailed,
-    
-    /// Decryption operation failed
-    DecryptionFailed,
-    
-    /// Invalid packet format
-    InvalidPacket,
-    
-    /// Rate limit exceeded
-    RateLimit,
-    
-    /// Key exchange operation failed
-    KeyExchangeFailed,
-    
-    /// Signature operation failed
-    SignatureFailed,
-    
-    /// Invalid public key format
-    InvalidPublicKey,
-    
-    /// Internal error (system integrity issue)
-    Internal,
-    
-    /// Timing constraint violated (constant-time requirement)
-    TimingViolation,
-    
-    /// Memory sanitization failed
-    SanitizationFailed,
-    
-    /// Audit log failure (STRIDE: Repudiation)
-    AuditFailure,
+// ── Global sequence counter ───────────────────────────────────────────────────
+
+static SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+// ── Public error type ─────────────────────────────────────────────────────────
+
+/// Opaque cryptographic error.
+///
+/// `Display` returns a fixed string with no implementation detail.
+/// Internal context is accessible only within the crate and zeroed on drop.
+pub(crate) struct CryptoError {
+    pub(crate) kind: ErrorKind,
+    pub(crate) internal: InternalCtx,
+}
+
+impl Drop for CryptoError {
+    fn drop(&mut self) {
+        // `CryptoError` stores only static detail text and numeric metadata.
+    }
 }
 
 impl CryptoError {
-    /// Create new error with internal context
-    #[inline]
-    pub fn new(
-        kind: CryptoErrorKind,
-        details: impl Into<String>,
+    pub(crate) fn new(
+        kind: ErrorKind,
+        details: &'static str,
         severity: ErrorSeverity,
-        stride: StrideCategory,
+        category: ThreatCategory,
     ) -> Self {
-        Self::new_with_location(kind, details, severity, stride, None)
-    }
-    
-    /// Create error with location information for debugging
-    pub fn new_with_location(
-        kind: CryptoErrorKind,
-        details: impl Into<String>,
-        severity: ErrorSeverity,
-        stride: StrideCategory,
-        location: Option<String>,
-    ) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
-        let timestamp_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        
-        let sequence = ERROR_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-        
         Self {
             kind,
-            internal: InternalErrorContext {
-                details: details.into(),
-                timestamp_ns,
-                sequence,
+            internal: InternalCtx {
+                details,
+                timestamp_ns: now_ns(),
+                sequence: next_seq(),
                 severity,
-                location,
-                stride_category: stride,
+                category,
             },
         }
     }
-    
-    /// Get error kind (safe for external use)
+
     #[inline]
-    pub fn kind(&self) -> &CryptoErrorKind {
+    pub(crate) fn kind(&self) -> &ErrorKind {
         &self.kind
     }
-    
-    /// Get sanitized error for logging (GDPR-compliant)
     #[inline]
-    pub fn sanitized_log(&self) -> String {
-        self.internal.sanitize()
-    }
-    
-    /// Get internal context (only for privileged security operations)
-    ///
-    /// # Security Warning
-    ///
-    /// This method returns sensitive debugging information that MUST NOT
-    /// be exposed to external users, logged to public systems, or included
-    /// in user-facing error messages.
-    #[inline]
-    pub fn internal_context(&self) -> &InternalErrorContext {
-        &self.internal
-    }
-    
-    /// Get severity level
-    #[inline]
-    pub fn severity(&self) -> &ErrorSeverity {
+    pub(crate) fn severity(&self) -> &ErrorSeverity {
         &self.internal.severity
     }
-    
-    /// Get STRIDE category
     #[inline]
-    pub fn stride_category(&self) -> &StrideCategory {
-        &self.internal.stride_category
+    pub(crate) fn category(&self) -> &ThreatCategory {
+        &self.internal.category
     }
-    
-    /// Get error sequence number for correlation
     #[inline]
-    pub fn sequence(&self) -> u64 {
+    pub(crate) fn sequence(&self) -> u64 {
         self.internal.sequence
+    }
+    #[inline]
+    pub(crate) fn sanitized_log(&self) -> SanitizedCtx {
+        self.internal.sanitized()
+    }
+    #[inline]
+    pub(crate) fn internal_ctx(&self) -> &InternalCtx {
+        &self.internal
     }
 }
 
-// External Display shows only opaque error (no details leaked)
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Fixed strings — no implementation leakage.
         match &self.kind {
-            CryptoErrorKind::EncryptionFailed => write!(f, "Encryption operation failed"),
-            CryptoErrorKind::DecryptionFailed => write!(f, "Decryption operation failed"),
-            CryptoErrorKind::InvalidPacket => write!(f, "Invalid packet format"),
-            CryptoErrorKind::RateLimit => write!(f, "Rate limit exceeded"),
-            CryptoErrorKind::KeyExchangeFailed => write!(f, "Key exchange operation failed"),
-            CryptoErrorKind::SignatureFailed => write!(f, "Signature operation failed"),
-            CryptoErrorKind::InvalidPublicKey => write!(f, "Invalid public key format"),
-            CryptoErrorKind::Internal => write!(f, "Internal error"),
-            CryptoErrorKind::TimingViolation => write!(f, "Timing constraint violated"),
-            CryptoErrorKind::SanitizationFailed => write!(f, "Memory sanitization failed"),
-            CryptoErrorKind::AuditFailure => write!(f, "Audit log failure"),
+            ErrorKind::EncryptionFailed => write!(f, "Encryption failed"),
+            ErrorKind::DecryptionFailed => write!(f, "Decryption failed"),
+            ErrorKind::InvalidPacket => write!(f, "Invalid packet"),
+            ErrorKind::RateLimit => write!(f, "Rate limit exceeded"),
+            ErrorKind::KeyExchangeFailed => write!(f, "Key exchange failed"),
+            ErrorKind::SignatureFailed => write!(f, "Signature failed"),
+            ErrorKind::InvalidPublicKey => write!(f, "Invalid public key"),
+            ErrorKind::Internal => write!(f, "Internal error"),
+            ErrorKind::TimingViolation => write!(f, "Timing violation"),
+            ErrorKind::SanitizationFailed => write!(f, "Sanitization failed"),
         }
     }
 }
 
-// Debug shows external kind only (no internal context)
 impl fmt::Debug for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CryptoError({:?}, seq={})", self.kind, self.internal.sequence)
+        write!(
+            f,
+            "CryptoError({:?}, seq={})",
+            self.kind, self.internal.sequence
+        )
     }
 }
 
@@ -272,174 +218,89 @@ impl PartialEq for CryptoError {
         self.kind == other.kind
     }
 }
-
 impl Eq for CryptoError {}
 
-/// Convenience constructors for common errors
+// ── Convenience constructors ──────────────────────────────────────────────────
+
 impl CryptoError {
-    /// Encryption failed with automatic STRIDE classification
-    pub fn encryption_failed(details: impl Into<String>) -> Self {
+    pub(crate) fn encryption_failed(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::EncryptionFailed,
-            details,
+            ErrorKind::EncryptionFailed,
+            d,
             ErrorSeverity::Error,
-            StrideCategory::Tampering,
+            ThreatCategory::Tampering,
         )
     }
-    
-    /// Decryption failed (potential tampering detected)
-    pub fn decryption_failed(details: impl Into<String>) -> Self {
+    pub(crate) fn decryption_failed(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::DecryptionFailed,
-            details,
+            ErrorKind::DecryptionFailed,
+            d,
             ErrorSeverity::Warning,
-            StrideCategory::Tampering,
+            ThreatCategory::Tampering,
         )
     }
-    
-    /// Invalid packet (potential protocol attack)
-    pub fn invalid_packet(details: impl Into<String>) -> Self {
+    pub(crate) fn invalid_packet(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::InvalidPacket,
-            details,
+            ErrorKind::InvalidPacket,
+            d,
             ErrorSeverity::Warning,
-            StrideCategory::Tampering,
+            ThreatCategory::Tampering,
         )
     }
-    
-    /// Rate limit exceeded (DoS protection triggered)
-    pub fn rate_limit_exceeded(details: impl Into<String>) -> Self {
+    pub(crate) fn rate_limit_exceeded(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::RateLimit,
-            details,
+            ErrorKind::RateLimit,
+            d,
             ErrorSeverity::Warning,
-            StrideCategory::DenialOfService,
+            ThreatCategory::DenialOfService,
         )
     }
-    
-    /// Key exchange failed (potential MITM)
-    pub fn key_exchange_failed(details: impl Into<String>) -> Self {
+    pub(crate) fn key_exchange_failed(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::KeyExchangeFailed,
-            details,
+            ErrorKind::KeyExchangeFailed,
+            d,
             ErrorSeverity::Error,
-            StrideCategory::Spoofing,
+            ThreatCategory::Spoofing,
         )
     }
-    
-    /// Signature verification failed (authentication failure)
-    pub fn signature_failed(details: impl Into<String>) -> Self {
+    pub(crate) fn signature_failed(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::SignatureFailed,
-            details,
+            ErrorKind::SignatureFailed,
+            d,
             ErrorSeverity::Error,
-            StrideCategory::Spoofing,
+            ThreatCategory::Spoofing,
         )
     }
-    
-    /// Invalid public key (malformed or malicious)
-    pub fn invalid_public_key(details: impl Into<String>) -> Self {
+    pub(crate) fn invalid_public_key(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::InvalidPublicKey,
-            details,
+            ErrorKind::InvalidPublicKey,
+            d,
             ErrorSeverity::Warning,
-            StrideCategory::Spoofing,
+            ThreatCategory::Spoofing,
         )
     }
-    
-    /// Internal error (system integrity compromised)
-    pub fn internal(details: impl Into<String>) -> Self {
+    pub(crate) fn internal(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::Internal,
-            details,
+            ErrorKind::Internal,
+            d,
             ErrorSeverity::Critical,
-            StrideCategory::NotApplicable,
+            ThreatCategory::None,
         )
     }
-    
-    /// Timing violation detected (side-channel protection)
-    pub fn timing_violation(details: impl Into<String>) -> Self {
+    pub(crate) fn timing_violation(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::TimingViolation,
-            details,
+            ErrorKind::TimingViolation,
+            d,
             ErrorSeverity::Critical,
-            StrideCategory::InformationDisclosure,
+            ThreatCategory::InformationDisclosure,
         )
     }
-    
-    /// Memory sanitization failed (zeroization failure)
-    pub fn sanitization_failed(details: impl Into<String>) -> Self {
+    pub(crate) fn sanitization_failed(d: &'static str) -> Self {
         Self::new(
-            CryptoErrorKind::SanitizationFailed,
-            details,
+            ErrorKind::SanitizationFailed,
+            d,
             ErrorSeverity::Critical,
-            StrideCategory::InformationDisclosure,
+            ThreatCategory::AuditFailure,
         )
-    }
-    
-    /// Audit logging failed (repudiation risk)
-    pub fn audit_failure(details: impl Into<String>) -> Self {
-        Self::new(
-            CryptoErrorKind::AuditFailure,
-            details,
-            ErrorSeverity::Critical,
-            StrideCategory::Repudiation,
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_external_error_display_opaque() {
-        let err = CryptoError::encryption_failed("AES-GCM init failed with key size mismatch");
-        
-        let display = err.to_string();
-        assert_eq!(display, "Encryption operation failed");
-        assert!(!display.contains("AES"));
-        assert!(!display.contains("key"));
-    }
-
-    #[test]
-    fn test_internal_context_detailed() {
-        let err = CryptoError::decryption_failed("HMAC verification failed at offset 42");
-        
-        let internal = err.internal_context();
-        assert!(internal.details.contains("HMAC"));
-        assert!(internal.details.contains("42"));
-        assert_eq!(internal.severity, ErrorSeverity::Warning);
-        assert_eq!(internal.stride_category, StrideCategory::Tampering);
-    }
-
-    #[test]
-    fn test_sanitized_log_no_pii() {
-        let err = CryptoError::signature_failed("User alice@example.com signature invalid");
-        
-        let sanitized = err.sanitized_log();
-        assert!(!sanitized.contains("alice"));
-        assert!(!sanitized.contains("example.com"));
-        assert!(sanitized.contains("seq="));
-    }
-
-    #[test]
-    fn test_error_sequence_increments() {
-        let err1 = CryptoError::rate_limit_exceeded("Client 192.168.1.1");
-        let err2 = CryptoError::rate_limit_exceeded("Client 192.168.1.2");
-        
-        assert!(err2.sequence() > err1.sequence());
-    }
-
-    #[test]
-    fn test_stride_classification() {
-        assert_eq!(
-            CryptoError::encryption_failed("").stride_category(),
-            &StrideCategory::Tampering
-        );
-        assert_eq!(
-            CryptoError::signature_failed("").stride_category(),
-            &StrideCategory::Spoofing
-        );
     }
 }

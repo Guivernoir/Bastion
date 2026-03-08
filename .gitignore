@@ -1,3 +1,22 @@
-y/
-target/
+/target/
+/results.txt
+/criterion/
 Cargo.lock
+
+# Fuzzing artifacts
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
+# Rust and tooling
+*.rs.bk
+*.profraw
+*.profdata
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

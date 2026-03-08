@@ -1,336 +1,197 @@
 # Bastion
 
-**Enterprise-grade post-quantum cryptographic library with military-grade operational security.**
+Bastion is a hardened cryptographic crate focused on strict operational constraints:
 
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Security](https://img.shields.io/badge/security-hardened-green.svg)](SECURITY.md)
+- post-quantum primitives: ML-KEM-1024 and ML-DSA-87
+- authenticated encryption: AES-256-GCM
+- SHA-512 hashing
+- zeroization of sensitive material
+- bounded public API with timing-floor normalization
+- runtime dependency-free (`[dependencies]` is empty)
+- allocation-aware measurement workflow
 
-> _"In cryptography, as in chess, the amateur focuses on tactics. The professional studies strategy."_
+## Public API
 
-## Overview
+Only these crate-level functions are public:
 
-Bastion is a hardened cryptographic library implementing post-quantum algorithms with comprehensive security controls. Unlike conventional crypto libraries that stop at correctness, Bastion enforces operational security through constant-time execution, dual-context error handling, comprehensive audit logging, and STRIDE threat model coverage.
+- `encrypt`
+- `encapsulate`
+- `sign`
+- `hash`
+- `compare`
+- `layer_encrypt`
+- `onion`
 
-### Key Features
+Current signatures are buffer-oriented (caller provides output memory):
 
-- 🛡️ **Post-Quantum Security**: ML-KEM-1024 (Kyber) and ML-DSA-87 (Dilithium) - NIST standardized
-- ⏱️ **Constant-Time Operations**: Timing guards enforce execution bounds, preventing side-channel attacks
-- 🔍 **Dual-Context Errors**: Internal debugging context + external opacity (no information leakage)
-- 📊 **STRIDE Coverage**: Comprehensive threat model mitigation with audit classification
-- 🔒 **Memory Safety**: Automatic zeroization with cryptographic verification
-- 🚦 **Rate Limiting**: Built-in DoS protection (1000 ops/sec symmetric, 100 ops/sec PQC)
-- 📝 **Audit Logging**: GDPR-compliant security event tracking
-- 🎯 **No-Clone Architecture**: Single-owner semantics prevent memory bloat and side channels
-- 🧱 **Onion Routing**: 3-layer encryption for anonymous communication
+```rust
+pub fn encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+    ciphertext_out: &mut [u8],
+    tag_out: &mut [u8; 16],
+) -> Result<usize, &'static str>;
 
-## Installation
+pub fn encapsulate(
+    pk: &[u8],
+    ct_out: &mut [u8; 1568],
+    ss_out: &mut [u8; 32],
+) -> Result<(), &'static str>;
 
-Add to your `Cargo.toml`:
+pub fn sign(
+    sk: &[u8],
+    msg: &[u8],
+    sig_out: &mut [u8; 4627],
+) -> Result<(), &'static str>;
+
+pub fn hash(data: &[u8]) -> [u8; 64];
+pub fn compare(a: &[u8], b: &[u8]) -> bool;
+
+pub fn layer_encrypt(
+    plaintext: &[u8],
+    kem_pks: [&[u8]; 3],
+    dsa_sks: [&[u8]; 3],
+    out: &mut [u8],
+) -> Result<usize, &'static str>;
+
+pub fn onion(
+    plaintext: &[u8],
+    kem_pks: &[&[u8]],
+    dsa_sks: &[&[u8]],
+    out: &mut [u8],
+) -> Result<usize, &'static str>;
+```
+
+## Install
 
 ```toml
 [dependencies]
-crypto-bastion = "0.1.0"
+crypto_bastion = "0.2"
 ```
 
 ## Quick Start
 
-### Onion Encryption (3-Layer)
+### Hash and Compare
 
 ```rust
-use bastion::*;
+use crypto_bastion::{compare, hash};
 
-fn main() -> Result<()> {
-    // Initialize 3-layer encryption (entry → relay → exit)
-    let encryptor = OnionEncryptor::new(
-        [1u8; 32],  // entry node key
-        [2u8; 32],  // relay node key
-        [3u8; 32],  // exit node key
-    )?;
-
-    // Encrypt message through all layers
-    let ciphertext = encryptor.encrypt(b"Strategic intelligence")?;
-
-    // Decrypt at each node (keys consumed, preventing reuse)
-    let entry_dec = OnionDecryptor::new([1u8; 32])?;
-    let layer1 = entry_dec.decrypt(&ciphertext)?;
-
-    let relay_dec = OnionDecryptor::new([2u8; 32])?;
-    let layer2 = relay_dec.decrypt(&layer1)?;
-
-    let exit_dec = OnionDecryptor::new([3u8; 32])?;
-    let plaintext = exit_dec.decrypt(&layer2)?;
-
-    assert_eq!(&plaintext[..], b"Strategic intelligence");
-    Ok(())
-}
+let a = hash(b"alpha");
+let b = hash(b"alpha");
+assert!(compare(&a, &b));
 ```
 
-### Post-Quantum Key Exchange
+### AES-256-GCM Encrypt
 
 ```rust
-use crypto_bastion::pqc::*;
+use crypto_bastion::encrypt;
 
-fn secure_channel() -> Result<()> {
-    // Alice and Bob generate keypairs
-    let alice = HybridKeyExchange::new()?;
-    let bob = HybridKeyExchange::new()?;
+let key = [0x11u8; 32];
+let nonce = [0x22u8; 12];
+let aad = b"context";
+let pt = b"payload";
 
-    // Alice encapsulates shared secret to Bob's public key
-    let (ciphertext, alice_key) = HybridKeyExchange::encapsulate(bob.public_key())?;
-
-    // Bob decapsulates to recover shared secret
-    let bob_key = bob.decapsulate(&ciphertext)?;
-
-    assert_eq!(alice_key, bob_key);  // 64-byte shared secret
-
-    // Keys automatically zeroized when dropped
-    Ok(())
-}
+let mut ct = vec![0u8; pt.len()];
+let mut tag = [0u8; 16];
+let n = encrypt(&key, &nonce, aad, pt, &mut ct, &mut tag)?;
+assert_eq!(n, pt.len());
+# Ok::<(), &'static str>(())
 ```
 
-### Digital Signatures
+### ML-KEM Encapsulation
 
 ```rust
-use crypto_bastion::pqc::*;
+use crypto_bastion::encapsulate;
 
-fn authenticated_message() -> Result<()> {
-    let keypair = SignatureKeypair::new()?;
-    let message = b"Execute Order 66";
-
-    // Sign message
-    let signature = keypair.sign(message)?;
-
-    // Verify signature (constant-time)
-    verify_signature(keypair.public_key(), message, &signature)?;
-
-    Ok(())
-}
+let pk = vec![0x55u8; 1568];
+let mut ct = [0u8; 1568];
+let mut ss = [0u8; 32];
+encapsulate(&pk, &mut ct, &mut ss)?;
+# Ok::<(), &'static str>(())
 ```
 
-### Constant-Time Operations
+### ML-DSA Signature
 
 ```rust
-use crypto_bastion::constant_time::*;
+use crypto_bastion::sign;
 
-fn secure_comparison() {
-    let secret = b"launch_codes_alpha_7";
-    let attempt = b"launch_codes_alpha_7";
-
-    // Constant-time equality (timing-attack resistant)
-    if ct_eq(secret, attempt) {
-        println!("Access granted");
-    }
-
-    // Verify buffer zeroization
-    let mut sensitive = vec![0x42u8; 1024];
-    ct_zeroize_verify(&mut sensitive).expect("Zeroization failed");
-}
+let sk = vec![0x66u8; 4896];
+let msg = b"signed-message";
+let mut sig = [0u8; 4627];
+sign(&sk, msg, &mut sig)?;
+# Ok::<(), &'static str>(())
 ```
 
-## Architecture
+### Layered Onion Encryption
 
-```
-┌─────────────────────────────────────────────────────┐
-│           Application Layer                         │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│  Crypto Operations                                  │
-│  • AES-256-GCM (authenticated encryption)           │
-│  • ML-KEM-1024 (post-quantum key exchange)          │
-│  • ML-DSA-87 (post-quantum signatures)              │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│  Hardened Standard                                  │
-│  • Constant-time primitives                         │
-│  • Dual-context error handling                      │
-│  • Comprehensive audit logging                      │
-└─────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────┐
-│  Security Enforcement                               │
-│  • Rate limiting (DoS protection)                   │
-│  • Memory zeroization (verified)                    │
-│  • Timing guards (side-channel protection)          │
-└─────────────────────────────────────────────────────┘
-```
+Per-layer overhead is `6223` bytes. Required output size is:
 
-## Security Model
-
-### STRIDE Threat Coverage
-
-| Threat                     | Mitigation                                      |
-| -------------------------- | ----------------------------------------------- |
-| **Spoofing**               | Post-quantum signatures (ML-DSA-87)             |
-| **Tampering**              | Authenticated encryption (AES-256-GCM)          |
-| **Repudiation**            | Comprehensive audit logging                     |
-| **Information Disclosure** | Opaque errors, memory zeroization               |
-| **Denial of Service**      | Rate limiting (1000/sec symmetric, 100/sec PQC) |
-| **Elevation of Privilege** | Immutable keys, least privilege                 |
-
-### Constant-Time Guarantees
-
-All cryptographic operations enforce timing constraints:
+- `plaintext.len() + (layers * 6223)`
 
 ```rust
-// Timing guard example
-let _guard = TimingGuard::new("operation", MIN_TIME_NS);
-// ... cryptographic operation ...
-_guard.verify()?;  // Fails if too fast or too slow
+use crypto_bastion::onion;
+
+let msg = b"onion-data";
+let kem0 = vec![0x01u8; 1568];
+let kem1 = vec![0x02u8; 1568];
+let dsa0 = vec![0x11u8; 4896];
+let dsa1 = vec![0x22u8; 4896];
+
+let kem = [kem0.as_slice(), kem1.as_slice()];
+let dsa = [dsa0.as_slice(), dsa1.as_slice()];
+
+let mut out = vec![0u8; msg.len() + (2 * 6223)];
+let packet_len = onion(msg, &kem, &dsa, &mut out)?;
+assert_eq!(packet_len, msg.len() + (2 * 6223));
+# Ok::<(), &'static str>(())
 ```
 
-Operations that complete too quickly indicate potential side-channel attacks. Violations are logged to `METRICS.timing_violations`.
+## Security and Engineering Constraints
 
-### Memory Safety
+- Secret material is zeroized in internal key/signing paths.
+- Public API wrappers enforce timing floors.
+- `compare` is constant-time over equal-length slices.
+- Public API paths are allocation-aware; measurements are generated by `write_results`.
+- Internal modules remain `pub(crate)`; no direct public key container exposure.
 
-- **Automatic Zeroization**: All sensitive data (keys, plaintexts) use `ZeroizeOnDrop`
-- **Verified Erasure**: Cryptographic verification ensures zeroization succeeded
-- **No-Clone Architecture**: Keys cannot be cloned, preventing accidental duplication
+See [SECURITY.md](SECURITY.md) for the detailed model and verification process.
 
-### Error Handling
-
-Dual-context error system:
-
-```rust
-let err = CryptoError::decryption_failed("HMAC tag mismatch at offset 42");
-
-// External display (safe for users)
-println!("{}", err);  // "Decryption operation failed"
-
-// Internal context (security team only)
-let internal = err.internal_context();
-println!("{}", internal.details);  // "HMAC tag mismatch at offset 42"
-```
-
-See [SECURITY.md](SECURITY.md) for comprehensive security documentation.
-
-## Compliance
-
-### GDPR
-
-- Data minimization (no PII in errors)
-- Purpose limitation (keys only for crypto)
-- Storage limitation (automatic zeroization)
-- Right to erasure (verified zeroization)
-
-### NIST Cybersecurity Framework
-
-- **Identify**: Comprehensive threat model (STRIDE)
-- **Protect**: Defense-in-depth (rate limiting, constant-time)
-- **Detect**: Audit logging, timing violation detection
-- **Respond**: Dual-context errors for incident response
-- **Recover**: Graceful degradation, no panic on errors
-
-## Performance Characteristics
-
-| Operation           | Rate Limit | Typical Latency |
-| ------------------- | ---------- | --------------- |
-| AES-256-GCM Encrypt | 1000/sec   | ~5 μs           |
-| AES-256-GCM Decrypt | 1000/sec   | ~5 μs           |
-| ML-KEM Encapsulate  | 100/sec    | ~50 μs          |
-| ML-KEM Decapsulate  | 100/sec    | ~60 μs          |
-| ML-DSA Sign         | 100/sec    | ~200 μs         |
-| ML-DSA Verify       | 100/sec    | ~100 μs         |
-
-_Note: Benchmarks are planned for future releases._
-
-## Testing
-
-Bastion includes comprehensive test coverage:
+## Verification Workflow
 
 ```bash
-# Unit tests
-cargo test
+# Formatting and checks
+cargo fmt
+cargo check --all-targets
+cargo test --all-targets
 
-# Integration tests
-cargo test --test integration_tests
+# Benchmarks
+cargo bench --bench public_api
 
-# Property-based tests
-cargo test --test property_tests
+# Allocation + memory + timing-spread report
+cargo run --example write_results
 
-# Fuzzing (requires cargo-fuzz)
-cargo fuzz run fuzz_onion_decrypt
-cargo fuzz run fuzz_constant_time
-cargo fuzz run fuzz_pqc_key_exchange
+# Fuzzing targets (cargo-fuzz + nightly)
+cd fuzz
+cargo +nightly fuzz run fuzz_hash_compare -- -max_total_time=30
+cargo +nightly fuzz run fuzz_encrypt_api -- -max_total_time=30
+cargo +nightly fuzz run fuzz_encaps_sign_api -- -max_total_time=30
+cargo +nightly fuzz run fuzz_onion_api -- -max_total_time=30
 ```
 
-### Test Categories
+## Repository Layout
 
-- **Unit Tests**: Individual function correctness
-- **Integration Tests**: Complete workflows, concurrency, error propagation
-- **Property Tests**: Cryptographic invariants (proptest)
-- **Fuzz Tests**: Malformed inputs, boundary conditions
-
-## Audit Metrics
-
-Access security metrics at runtime:
-
-```rust
-use bastion::METRICS;
-use std::sync::atomic::Ordering;
-
-let total = METRICS.total_operations.load(Ordering::Relaxed);
-let failures = METRICS.failed_operations.load(Ordering::Relaxed);
-let tampering = METRICS.tampering_detected.load(Ordering::Relaxed);
-
-println!("Operations: {}, Failures: {}, Tampering: {}",
-         total, failures, tampering);
-```
-
-## Future Work
-
-### Planned Features
-
-- [ ] **Benchmarking Suite**: Comprehensive performance measurements across platforms
-- [ ] **Hardware Acceleration**: AES-NI, AVX2 optimizations
-- [ ] **Extended PQC**: Additional NIST finalists (BIKE, HQC)
-- [ ] **Threshold Cryptography**: Multi-party computation primitives
-- [ ] **HSM Integration**: Hardware security module support
-
-### Research Areas
-
-- [ ] **Formal Verification**: Coq/Lean proofs of constant-time properties
-- [ ] **Side-Channel Analysis**: Power analysis resistance validation
-- [ ] **Quantum-Safe Hybrid**: X25519 + ML-KEM composition
-
-## Contributing
-
-Contributions are welcome, particularly in:
-
-- Security audits and vulnerability reports
-- Performance optimizations (with constant-time preservation)
-- Additional test coverage
-- Documentation improvements
-
-**Security Disclosure**: Report vulnerabilities privately to strukturaenterprise@gmail.com
+- `src/lib.rs` public API and hybrid orchestration
+- `src/algos/aes256gcm/` AES-GCM internals
+- `src/algos/mlkem1024/` ML-KEM internals
+- `src/algos/mldsa87/` ML-DSA internals
+- `src/constant_time.rs` constant-time helpers and timing guard
+- `src/zeroize.rs` zeroization primitives
+- `examples/` usage and reporting tools
+- `benches/` criterion benchmark suites
+- `fuzz/` libFuzzer targets
 
 ## License
 
-Dual-licensed under MIT or Apache 2.0, at your option.
-
-## Acknowledgments
-
-Built on the shoulders of:
-
-- **pqc_kyber**: ML-KEM-1024 implementation
-- **pqc_dilithium**: ML-DSA-87 implementation
-- **aes-gcm**: Authenticated encryption
-- **subtle**: Constant-time primitives
-- **zeroize**: Memory erasure
-
-## Citation
-
-```bibtex
-@software{bastion2026,
-  title = {Bastion: Hybrid Post-Quantum Cryptography},
-  year = {2026},
-  author = {Guilherme F. G. Santos},
-  url = {https://github.com/Guivernoir/Bastion}
-}
-```
-
----
-
-_"Security is a process, not a product. Bastion is both."_
+Licensed under MIT OR Apache-2.0.

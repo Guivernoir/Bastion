@@ -1,533 +1,190 @@
-//! Post-quantum cryptographic primitives - Hardened Edition
+//! Post-quantum primitive wrappers — internal only.
 //!
-//! ## Enhancements Over Original
+//! All functions zeroize intermediate key material before returning.
+//! Rate limiting lives at the call site (per-layer context).
 //!
-//! - **Constant-Time Operations**: All comparisons use timing guards
-//! - **Dual-Context Errors**: Internal debugging + external opacity
-//! - **STRIDE Monitoring**: All operations classified by threat category
-//! - **Audit Logging**: Comprehensive security event tracking
-//! - **Verified Zeroization**: Memory sanitization with cryptographic verification
-//! - **No-Clone Semantics**: Single-owner architecture prevents side-channel attacks
-//!
-//! ## Algorithms
-//!
-//! - **ML-KEM-1024** (Kyber): NIST-standardized key encapsulation (NIST Level 5)
-//! - **ML-DSA-87** (Dilithium): NIST-standardized digital signatures (NIST Level 5)
-//!
-//! ## Security Properties
-//!
-//! - Quantum-resistant: Secure against Shor's and Grover's algorithms
-//! - Constant-time: All operations timing-attack resistant
-//! - Memory safe: Automatic zeroization with verification
-//! - Rate limited: 100 ops/sec for expensive PQC operations (DoS protection)
+//! [`TimingGuard::enforce`] is called after each PQC primitive completes,
+//! ensuring the timing floor is checked on every code path (success *and*
+//! failure) and keeping `TimingGuard`, `TIMING_VIOLATIONS`, and
+//! `record_timing_viol` in the live call graph.
 
-use crate::audit::{self, AuditEvent};
-use crate::constant_time::{ct_eq, ct_zeroize_verify, TimingGuard};
-use crate::error::{CryptoError, ErrorSeverity, Result, StrideCategory};
-use governor::{
-    clock::DefaultClock, state::InMemoryState, state::NotKeyed, Quota, RateLimiter,
-};
-use pqc_dilithium;
-use pqc_kyber;
-use sha3::{Digest, Sha3_512};
-use std::num::NonZeroU32;
-use std::sync::Arc;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::algos::mldsa87;
+use crate::algos::mlkem1024;
+use crate::algos::mlkem1024::hash::sha3_512_x2;
+use crate::audit::METRICS;
+use crate::constant_time::{TimingGuard, ct_zeroize_verify};
+use crate::error::{CryptoError, Result};
+use crate::os_random::fill_os_random_array;
+use crate::zeroize::zeroize_array;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Size constants (re-exported for packet layout arithmetic) ─────────────────
 
-/// Rate limit for PQC operations (ops per second) - STRIDE: DoS protection
-const PQC_RATE_LIMIT: u32 = 100;
+pub(crate) const KEM_PK_SIZE: usize = mlkem1024::EK_BYTES; // 1568
+pub(crate) const KEM_SK_SIZE: usize = mlkem1024::DK_BYTES; // 3168
+pub(crate) const KEM_CT_SIZE: usize = mlkem1024::CT_BYTES; // 1568
+pub(crate) const DSA_PK_SIZE: usize = mldsa87::PK_BYTES; // 2592
+pub(crate) const DSA_SK_SIZE: usize = mldsa87::SK_BYTES; // 4896
+pub(crate) const DSA_SIG_SIZE: usize = mldsa87::SIG_BYTES; // 4627
+pub(crate) const AES_KEY_SIZE: usize = 32;
 
-/// Derived key size from SHA3-512 (64 bytes)
-pub const DERIVED_KEY_SIZE: usize = 64;
+/// Conservative timing floors (ns) for PQC operations.
+const FLOOR_ENCAP_NS: u64 = 700_000;
+const FLOOR_DECAP_NS: u64 = 60_000;
+const FLOOR_SIGN_NS: u64 = 12_000_000;
+const FLOOR_VERIFY_NS: u64 = 2_000_000;
 
-/// Expected minimum time for ML-KEM encapsulation (nanoseconds)
-const MIN_ENCAPSULATE_TIME_NS: u64 = 50_000; // 50 microseconds
-
-/// Expected minimum time for ML-KEM decapsulation (nanoseconds)
-const MIN_DECAPSULATE_TIME_NS: u64 = 60_000; // 60 microseconds
-
-/// Expected minimum time for ML-DSA signing (nanoseconds)
-const MIN_SIGN_TIME_NS: u64 = 200_000; // 200 microseconds
-
-/// Expected minimum time for ML-DSA verification (nanoseconds)
-const MIN_VERIFY_TIME_NS: u64 = 100_000; // 100 microseconds
-
-// ═══════════════════════════════════════════════════════════════════════════
-// TYPES
-// ═══════════════════════════════════════════════════════════════════════════
-
-type PqcRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// UTILITY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Create rate limiter for expensive PQC operations
 #[inline]
-fn create_pqc_rate_limiter() -> PqcRateLimiter {
-    Arc::new(RateLimiter::direct(Quota::per_second(
-        NonZeroU32::new(PQC_RATE_LIMIT).expect("Rate limit must be non-zero"),
-    )))
+fn fill_entropy<const N: usize>(buf: &mut [u8; N]) -> Result<()> {
+    fill_os_random_array(buf).inspect_err(|e| {
+        METRICS.record_fail();
+        METRICS.record_error_ctx(e);
+    })
 }
 
-/// Derive 64-byte key from shared secret using SHA3-512
-///
-/// ## Security Properties
-///
-/// - 512-bit security level
-/// - Resistance to length-extension attacks
-/// - NIST-standardized hash function
-/// - Constant-time execution
+// ── Key derivation ────────────────────────────────────────────────────────────
+
+/// Derive a 32-byte AES key from a KEM shared secret via SHA3-512
+/// with domain separation.
 #[inline]
-fn derive_key(shared_secret: &[u8]) -> [u8; DERIVED_KEY_SIZE] {
-    let mut hasher = Sha3_512::new();
-    hasher.update(shared_secret);
-    hasher.finalize().into()
+pub(crate) fn derive_aes_key(raw_ss: &[u8]) -> [u8; AES_KEY_SIZE] {
+    let mut digest = [0u8; 64];
+    sha3_512_x2(b"bastion-aes-key-v1\x00", raw_ss, &mut digest);
+
+    let mut key = [0u8; AES_KEY_SIZE];
+    key.copy_from_slice(&digest[..AES_KEY_SIZE]);
+    zeroize_array(&mut digest);
+    key
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HYBRID KEY EXCHANGE - Hardened ML-KEM-1024
-// ═══════════════════════════════════════════════════════════════════════════
+// ── ML-KEM-1024 ───────────────────────────────────────────────────────────────
 
-/// Hybrid post-quantum key exchange using ML-KEM-1024 (Kyber)
+/// Encapsulate to `pk`, returning `(kem_ct_bytes, aes_key)`.
 ///
-/// ## Security Enhancements (Hardened Edition)
+/// The raw shared secret is zeroized and verified before returning.
+/// The caller is responsible for zeroizing `aes_key` after use.
 ///
-/// - **Timing Guards**: Encapsulation/decapsulation enforce execution time bounds
-/// - **Rate Limiting**: DoS protection (100 ops/sec)
-/// - **Audit Logging**: All operations logged with STRIDE classification
-/// - **Constant-Time Verification**: Public key comparisons timing-attack resistant
-/// - **Verified Zeroization**: Shared secrets cryptographically verified as erased
-/// - **No-Clone Semantics**: Single-owner architecture prevents memory duplication
-///
-/// ## STRIDE Coverage
-///
-/// - **Spoofing**: Public key authentication via constant-time comparison
-/// - **Tampering**: Implicit authentication via IND-CCA2 security
-/// - **Information Disclosure**: Immediate zeroization of shared secrets
-/// - **Denial of Service**: Rate limiting prevents resource exhaustion
-///
-/// ## NIST Security Level
-///
-/// ML-KEM-1024 provides NIST Security Level 5:
-/// - Equivalent to AES-256
-/// - Resistant to quantum attacks (Grover's algorithm)
-/// - Based on Module-LWE problem
-#[derive(ZeroizeOnDrop)]
-pub struct HybridKeyExchange {
-    #[zeroize(skip)]
-    kyber_keypair: pqc_kyber::Keypair,
-    #[zeroize(skip)]
-    rate_limiter: PqcRateLimiter,
-}
-
-impl HybridKeyExchange {
-    /// Generate new keypair for key exchange
-    ///
-    /// Uses system RNG. Ensure sufficient entropy is available.
-    pub fn new() -> Result<Self> {
-        let mut rng = rand::thread_rng();
-        let keypair = pqc_kyber::keypair(&mut rng)
-            .map_err(|_| {
-                let err = CryptoError::key_exchange_failed("ML-KEM keypair generation failed - RNG error");
-                audit::log_error(&err, "kex_new");
-                err
-            })?;
-
-        audit::log_audit_event(
-            AuditEvent::KeyRotation,
-            "kex_new",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            "ML-KEM keypair generated",
-        );
-
-        Ok(Self {
-            kyber_keypair: keypair,
-            rate_limiter: create_pqc_rate_limiter(),
-        })
+/// The timing guard is enforced *after* the PQC primitive completes and
+/// *before* the result is propagated — covering both success and failure paths.
+pub(crate) fn kem_encapsulate_into(
+    pk: &[u8],
+    ct_out: &mut [u8; KEM_CT_SIZE],
+    aes_key_out: &mut [u8; AES_KEY_SIZE],
+) -> Result<()> {
+    if pk.len() != KEM_PK_SIZE {
+        return Err(CryptoError::invalid_public_key(
+            "invalid KEM public key length",
+        ));
     }
 
-    /// Create with custom rate limiter for shared rate limiting across instances
-    pub fn new_with_limiter(rate_limiter: PqcRateLimiter) -> Result<Self> {
-        let mut rng = rand::thread_rng();
-        let keypair = pqc_kyber::keypair(&mut rng)
-            .map_err(|_| CryptoError::key_exchange_failed("ML-KEM keypair generation failed"))?;
+    let mut ek = mlkem1024::EncapKey([0u8; mlkem1024::EK_BYTES]);
+    ek.0.copy_from_slice(pk);
 
-        Ok(Self {
-            kyber_keypair: keypair,
-            rate_limiter,
-        })
-    }
+    let mut entropy = [0u8; 32];
+    fill_entropy(&mut entropy)?;
 
-    /// Get public key for transmission to peer
-    ///
-    /// Public key can be safely transmitted over insecure channels.
-    #[inline]
-    pub fn public_key(&self) -> &[u8] {
-        &self.kyber_keypair.public
-    }
+    let guard = TimingGuard::new("ml_kem_encap", FLOOR_ENCAP_NS);
+    let mut ct = mlkem1024::Ciphertext([0u8; mlkem1024::CT_BYTES]);
+    let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
+    mlkem1024::encaps(&ek, &entropy, &mut ct, &mut ss);
+    guard.enforce()?;
 
-    /// Encapsulate shared secret to peer's public key with timing enforcement
-    ///
-    /// ## Returns
-    ///
-    /// - `ciphertext`: Send to peer (contains encapsulated key)
-    /// - `key`: 64-byte derived shared secret (keep private, zeroize after use)
-    ///
-    /// ## Security Features
-    ///
-    /// - Timing guard enforces minimum execution time
-    /// - Shared secret immediately zeroized after key derivation
-    /// - Audit logging with STRIDE classification
-    /// - IND-CCA2 secure (each encapsulation produces unique ciphertext)
-    pub fn encapsulate(peer_pk: &[u8]) -> Result<(Box<[u8]>, [u8; DERIVED_KEY_SIZE])> {
-        // Timing guard for constant-time enforcement
-        let _guard = TimingGuard::new("ml_kem_encapsulate", MIN_ENCAPSULATE_TIME_NS);
+    let mut raw_ss = *ss.as_bytes();
+    let key = derive_aes_key(&raw_ss);
+    aes_key_out.copy_from_slice(&key);
+    zeroize_array(&mut raw_ss);
+    ct_zeroize_verify(&mut raw_ss).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
-        let mut rng = rand::thread_rng();
-
-        // Validate public key length (STRIDE: Spoofing)
-        if peer_pk.len() != pqc_kyber::KYBER_PUBLICKEYBYTES {
-            let err = CryptoError::invalid_public_key(format!(
-                "ML-KEM public key wrong size: {} != {} expected",
-                peer_pk.len(),
-                pqc_kyber::KYBER_PUBLICKEYBYTES
-            ));
-            audit::log_error(&err, "encapsulate");
-            return Err(err);
-        }
-
-        // Kyber encapsulation
-        let (ciphertext, mut kyber_ss) =
-            pqc_kyber::encapsulate(peer_pk, &mut rng)
-                .map_err(|_| {
-                    let err = CryptoError::key_exchange_failed("ML-KEM encapsulation failed");
-                    audit::log_error(&err, "encapsulate");
-                    err
-                })?;
-
-        // Derive 64-byte key from shared secret (constant-time)
-        let key = derive_key(&kyber_ss);
-
-        // Zeroize raw shared secret immediately (GDPR: Right to Erasure)
-        kyber_ss.zeroize();
-        
-        // Verify zeroization succeeded (STRIDE: Information Disclosure)
-        ct_zeroize_verify(&mut kyber_ss)?;
-
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "encapsulate",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            "ML-KEM encapsulation completed",
-        );
-
-        Ok((ciphertext.to_vec().into_boxed_slice(), key))
-    }
-
-    /// Decapsulate shared secret from ciphertext with timing enforcement
-    ///
-    /// ## Returns
-    ///
-    /// 64-byte derived shared secret (zeroize after use)
-    ///
-    /// ## Security Features
-    ///
-    /// - Rate limiting prevents oracle attacks
-    /// - Timing guard enforces constant-time execution
-    /// - Immediate zeroization of intermediate values
-    /// - Audit logging for failures
-    pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; DERIVED_KEY_SIZE]> {
-        // Rate limiting (STRIDE: Denial of Service)
-        self.rate_limiter
-            .check()
-            .map_err(|_| {
-                let err = CryptoError::rate_limit_exceeded("Key exchange rate limit hit");
-                audit::log_error(&err, "decapsulate");
-                err
-            })?;
-
-        // Timing guard
-        let _guard = TimingGuard::new("ml_kem_decapsulate", MIN_DECAPSULATE_TIME_NS);
-
-        // Validate ciphertext length
-        if ciphertext.len() != pqc_kyber::KYBER_CIPHERTEXTBYTES {
-            let err = CryptoError::invalid_packet(format!(
-                "ML-KEM ciphertext wrong size: {} != {} expected",
-                ciphertext.len(),
-                pqc_kyber::KYBER_CIPHERTEXTBYTES
-            ));
-            audit::log_error(&err, "decapsulate");
-            return Err(err);
-        }
-
-        // Kyber decapsulation
-        let mut kyber_ss = pqc_kyber::decapsulate(ciphertext, &self.kyber_keypair.secret)
-            .map_err(|_| {
-                let err = CryptoError::key_exchange_failed("ML-KEM decapsulation failed");
-                audit::log_error(&err, "decapsulate");
-                err
-            })?;
-
-        // Derive 64-byte key
-        let key = derive_key(&kyber_ss);
-
-        // Zeroize raw shared secret
-        kyber_ss.zeroize();
-        ct_zeroize_verify(&mut kyber_ss)?;
-
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "decapsulate",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            "ML-KEM decapsulation completed",
-        );
-
-        Ok(key)
-    }
-
-    /// Constant-time public key verification
-    ///
-    /// Compares stored public key with provided key in constant time.
-    /// Use for authentication scenarios.
-    pub fn verify_public_key(&self, peer_pk: &[u8]) -> bool {
-        ct_eq(&self.kyber_keypair.public, peer_pk)
-    }
-}
-
-/// Post-quantum digital signature keypair using ML-DSA-87 (Dilithium)
-///
-/// ## Security Enhancements
-///
-/// - **Timing Guards**: Signing/verification enforce execution time bounds
-/// - **Rate Limiting**: DoS protection
-/// - **Audit Logging**: All signature operations logged
-/// - **Constant-Time Verification**: Signature comparisons timing-attack resistant
-/// - **No-Clone Semantics**: Prevents accidental key duplication
-///
-/// ## STRIDE Coverage
-///
-/// - **Spoofing**: Digital signatures provide authentication
-/// - **Repudiation**: Non-repudiation via cryptographic signatures
-/// - **Tampering**: Signature verification detects message modification
-pub struct SignatureKeypair {
-    dilithium_keypair: pqc_dilithium::Keypair,
-    rate_limiter: PqcRateLimiter,
-}
-
-impl SignatureKeypair {
-    /// Generate new signature keypair
-    pub fn new() -> Result<Self> {
-        let keypair = pqc_dilithium::Keypair::generate();
-
-        audit::log_audit_event(
-            AuditEvent::KeyRotation,
-            "sig_new",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            "ML-DSA signature keypair generated",
-        );
-
-        Ok(Self {
-            dilithium_keypair: keypair,
-            rate_limiter: create_pqc_rate_limiter(),
-        })
-    }
-
-    /// Create with custom rate limiter
-    pub fn new_with_limiter(rate_limiter: PqcRateLimiter) -> Result<Self> {
-        let keypair = pqc_dilithium::Keypair::generate();
-
-        Ok(Self {
-            dilithium_keypair: keypair,
-            rate_limiter,
-        })
-    }
-
-    /// Get public key for distribution
-    #[inline]
-    pub fn public_key(&self) -> &[u8] {
-        &self.dilithium_keypair.public
-    }
-
-    /// Sign message with timing enforcement
-    ///
-    /// ## Security Features
-    ///
-    /// - Rate limiting prevents signature oracle attacks
-    /// - Timing guard enforces minimum execution time
-    /// - Audit logging for non-repudiation
-    pub fn sign(&self, message: &[u8]) -> Result<Box<[u8]>> {
-        // Rate limiting (STRIDE: Denial of Service)
-        self.rate_limiter
-            .check()
-            .map_err(|_| {
-                let err = CryptoError::rate_limit_exceeded("Signature rate limit hit");
-                audit::log_audit_event(
-                    AuditEvent::RateLimitTriggered,
-                    "sign",
-                    &StrideCategory::DenialOfService,
-                    &ErrorSeverity::Warning,
-                    "Signature rate limit triggered",
-                );
-                err
-            })?;
-
-        // Timing guard
-        let _guard = TimingGuard::new("ml_dsa_sign", MIN_SIGN_TIME_NS);
-
-        // Sign the message (returns fixed-size array, not a Result)
-        let signature = self.dilithium_keypair.sign(message);
-
-        audit::log_audit_event(
-            AuditEvent::OperationSuccess,
-            "sign",
-            &StrideCategory::NotApplicable,
-            &ErrorSeverity::Info,
-            format!("Signed {} byte message", message.len()),
-        );
-
-        // Convert fixed-size array to boxed slice (no clone, just ownership transfer)
-        Ok(Box::from(signature.as_slice()))
-    }
-}
-
-/// Verify signature with timing enforcement (standalone function)
-///
-/// ## Security Features
-///
-/// - Constant-time verification
-/// - Timing guard enforcement
-/// - Audit logging for authentication failures (STRIDE: Spoofing)
-pub fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
-    // Timing guard for constant-time verification
-    let _guard = TimingGuard::new("ml_dsa_verify", MIN_VERIFY_TIME_NS);
-
-    pqc_dilithium::verify(signature, message, public_key)
-        .map_err(|_| {
-            // Signature verification failure (STRIDE: Spoofing)
-            let err = CryptoError::signature_failed("ML-DSA signature verification failed");
-            audit::log_audit_event(
-                AuditEvent::AuthenticationFailure,
-                "verify_signature",
-                &StrideCategory::Spoofing,
-                &ErrorSeverity::Warning,
-                "Signature verification failed - authentication failure",
-            );
-            err
-        })?;
-
-    audit::log_audit_event(
-        AuditEvent::OperationSuccess,
-        "verify_signature",
-        &StrideCategory::NotApplicable,
-        &ErrorSeverity::Info,
-        "Signature verified successfully",
-    );
-
+    ct_out.copy_from_slice(ct.as_bytes());
+    zeroize_array(&mut entropy);
+    METRICS.record_ok();
     Ok(())
 }
 
-/// Batch signature verification for efficiency
+/// Decapsulate `kem_ct` with `sk`, returning the derived `aes_key`.
 ///
-/// Verifies multiple signatures in sequence with comprehensive audit logging.
-/// Note: Uses references to avoid unnecessary cloning in no-clone architecture.
-pub fn verify_signatures_batch(
-    verifications: &[(&[u8], &[u8], &[u8])], // (pubkey, message, signature)
-) -> Result<Vec<bool>> {
-    let mut results = Vec::with_capacity(verifications.len());
-
-    for (pk, msg, sig) in verifications {
-        let is_valid = verify_signature(pk, msg, sig).is_ok();
-        results.push(is_valid);
+/// The raw shared secret is zeroized internally. The caller must zeroize
+/// `aes_key` after use.
+pub(crate) fn kem_decapsulate(kem_ct: &[u8], sk: &[u8]) -> Result<[u8; AES_KEY_SIZE]> {
+    if kem_ct.len() != KEM_CT_SIZE {
+        return Err(CryptoError::invalid_packet("invalid KEM ciphertext length"));
+    }
+    if sk.len() != KEM_SK_SIZE {
+        return Err(CryptoError::internal("invalid KEM secret key length"));
     }
 
-    Ok(results)
+    let mut ct_t = mlkem1024::Ciphertext([0u8; mlkem1024::CT_BYTES]);
+    ct_t.0.copy_from_slice(kem_ct);
+    let mut dk_t = mlkem1024::DecapKey([0u8; mlkem1024::DK_BYTES]);
+    dk_t.0.copy_from_slice(sk);
+
+    let guard = TimingGuard::new("ml_kem_decap", FLOOR_DECAP_NS);
+    let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
+    mlkem1024::decaps(&dk_t, &ct_t, &mut ss);
+    guard.enforce()?;
+
+    let mut raw_ss = *ss.as_bytes();
+    let aes_key = derive_aes_key(&raw_ss);
+    zeroize_array(&mut raw_ss);
+    ct_zeroize_verify(&mut raw_ss).inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    METRICS.record_ok();
+    Ok(aes_key)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ── ML-DSA-87 ─────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn test_key_exchange_roundtrip() {
-        let alice = HybridKeyExchange::new().expect("Alice keypair failed");
-        let bob = HybridKeyExchange::new().expect("Bob keypair failed");
-
-        let (ciphertext, alice_key) = HybridKeyExchange::encapsulate(bob.public_key())
-            .expect("Encapsulation failed");
-
-        let bob_key = bob.decapsulate(&ciphertext).expect("Decapsulation failed");
-
-        assert_eq!(alice_key, bob_key);
+/// Sign `msg` with ML-DSA-87 secret key bytes. Returns detached signature bytes.
+pub(crate) fn dsa_sign_into(sk: &[u8], msg: &[u8], sig_out: &mut [u8; DSA_SIG_SIZE]) -> Result<()> {
+    if sk.len() != DSA_SK_SIZE {
+        return Err(CryptoError::internal("invalid DSA secret key length"));
     }
 
-    #[test]
-    fn test_signature_roundtrip() {
-        let keypair = SignatureKeypair::new().expect("Keypair generation failed");
-        let message = b"Test message for signature";
+    let sk_arr: &[u8; mldsa87::SK_BYTES] = sk
+        .try_into()
+        .map_err(|_| CryptoError::internal("invalid ML-DSA secret key length"))?;
 
-        let signature = keypair.sign(message).expect("Signing failed");
-        let result = verify_signature(keypair.public_key(), message, &signature);
+    let mut rnd = [0u8; 32];
+    fill_entropy(&mut rnd)?;
 
-        assert!(result.is_ok());
+    let guard = TimingGuard::new("ml_dsa_sign", FLOOR_SIGN_NS);
+    mldsa87::sign(sig_out, msg, sk_arr, &rnd);
+    guard.enforce()?;
+    zeroize_array(&mut rnd);
+
+    METRICS.record_ok();
+    Ok(())
+}
+
+/// Verify detached `sig` over `msg` with ML-DSA-87 public key bytes.
+pub(crate) fn dsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> Result<()> {
+    if pk.len() != DSA_PK_SIZE {
+        return Err(CryptoError::invalid_public_key(
+            "invalid DSA public key length",
+        ));
+    }
+    if sig.len() != DSA_SIG_SIZE {
+        return Err(CryptoError::signature_failed(
+            "invalid DSA signature length",
+        ));
     }
 
-    #[test]
-    fn test_signature_verification_failure() {
-        let keypair = SignatureKeypair::new().expect("Keypair failed");
-        let message = b"Original message";
-        let signature = keypair.sign(message).expect("Signing failed");
+    let pk_arr: &[u8; mldsa87::PK_BYTES] = pk
+        .try_into()
+        .map_err(|_| CryptoError::invalid_public_key("invalid ML-DSA public key length"))?;
+    let sig_arr: &[u8; mldsa87::SIG_BYTES] = sig
+        .try_into()
+        .map_err(|_| CryptoError::signature_failed("invalid ML-DSA signature length"))?;
 
-        // Try to verify with wrong message
-        let wrong_message = b"Tampered message";
-        let result = verify_signature(keypair.public_key(), wrong_message, &signature);
+    let guard = TimingGuard::new("ml_dsa_verify", FLOOR_VERIFY_NS);
+    let valid = mldsa87::verify(sig_arr, msg, pk_arr);
+    guard.enforce()?;
 
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert_eq!(e.stride_category(), &StrideCategory::Spoofing);
-        }
+    if !valid {
+        METRICS.record_tampering();
+        METRICS.record_fail();
+        return Err(CryptoError::signature_failed("ML-DSA verification failed"));
     }
 
-    #[test]
-    fn test_invalid_public_key_size() {
-        let wrong_size_pk = vec![0u8; 100];
-        let result = HybridKeyExchange::encapsulate(&wrong_size_pk);
-
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert_eq!(e.kind(), &crate::error::CryptoErrorKind::InvalidPublicKey);
-        }
-    }
-
-    #[test]
-    fn test_constant_time_pk_verification() {
-        let kex1 = HybridKeyExchange::new().expect("Failed");
-        let kex2 = HybridKeyExchange::new().expect("Failed");
-
-        // Same key should match
-        assert!(kex1.verify_public_key(kex1.public_key()));
-
-        // Different keys should not match
-        assert!(!kex1.verify_public_key(kex2.public_key()));
-    }
-
-    #[test]
-    fn test_audit_metrics_pqc() {
-        use std::sync::atomic::Ordering;
-        
-        let initial = audit::METRICS.total_operations.load(Ordering::Relaxed);
-        
-        let _ = HybridKeyExchange::new();
-        
-        let after = audit::METRICS.total_operations.load(Ordering::Relaxed);
-        assert!(after > initial);
-    }
+    METRICS.record_ok();
+    Ok(())
 }

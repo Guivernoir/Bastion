@@ -1,5 +1,5 @@
 [package]
-name = "veil-crypto-fuzz"
+name = "crypto_bastion-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,43 +9,34 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
 
-[dependencies.veil_crypto]
+[dependencies.crypto_bastion]
 path = ".."
 
 [[bin]]
-name = "fuzz_onion_decrypt"
-path = "fuzz_targets/fuzz_onion_decrypt.rs"
+name = "fuzz_hash_compare"
+path = "fuzz_targets/fuzz_hash_compare.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
-name = "fuzz_constant_time"
-path = "fuzz_targets/fuzz_constant_time.rs"
+name = "fuzz_encrypt_api"
+path = "fuzz_targets/fuzz_encrypt_api.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
-name = "fuzz_pqc_key_exchange"
-path = "fuzz_targets/fuzz_pqc_key_exchange.rs"
+name = "fuzz_encaps_sign_api"
+path = "fuzz_targets/fuzz_encaps_sign_api.rs"
 test = false
 doc = false
+bench = false
 
 [[bin]]
-name = "fuzz_signatures"
-path = "fuzz_targets/fuzz_signatures.rs"
+name = "fuzz_onion_api"
+path = "fuzz_targets/fuzz_onion_api.rs"
 test = false
 doc = false
-
-[[bin]]
-name = "fuzz_arithmetic"
-path = "fuzz_targets/fuzz_arithmetic.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "fuzz_integration"
-path = "fuzz_targets/fuzz_integration.rs"
-test = false
-doc = false
+bench = false
