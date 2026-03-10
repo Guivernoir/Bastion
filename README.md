@@ -15,12 +15,17 @@ Bastion is a hardened cryptographic crate focused on strict operational constrai
 Only these crate-level functions are public:
 
 - `encrypt`
+- `decrypt`
 - `encapsulate`
+- `decapsulate`
 - `sign`
+- `verify`
 - `hash`
 - `compare`
 - `layer_encrypt`
+- `layer_decrypt`
 - `onion`
+- `cut`
 
 Current signatures are buffer-oriented (caller provides output memory):
 
@@ -34,9 +39,24 @@ pub fn encrypt(
     tag_out: &mut [u8; 16],
 ) -> Result<usize, &'static str>;
 
+pub fn decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+    plaintext_out: &mut [u8],
+) -> Result<usize, &'static str>;
+
 pub fn encapsulate(
     pk: &[u8],
     ct_out: &mut [u8; 1568],
+    ss_out: &mut [u8; 32],
+) -> Result<(), &'static str>;
+
+pub fn decapsulate(
+    sk: &[u8],
+    ct: &[u8],
     ss_out: &mut [u8; 32],
 ) -> Result<(), &'static str>;
 
@@ -45,6 +65,8 @@ pub fn sign(
     msg: &[u8],
     sig_out: &mut [u8; 4627],
 ) -> Result<(), &'static str>;
+
+pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool;
 
 pub fn hash(data: &[u8]) -> [u8; 64];
 pub fn compare(a: &[u8], b: &[u8]) -> bool;
@@ -56,10 +78,24 @@ pub fn layer_encrypt(
     out: &mut [u8],
 ) -> Result<usize, &'static str>;
 
+pub fn layer_decrypt(
+    packet: &[u8],
+    kem_sks: [&[u8]; 3],
+    dsa_pks: [&[u8]; 3],
+    out: &mut [u8],
+) -> Result<usize, &'static str>;
+
 pub fn onion(
     plaintext: &[u8],
     kem_pks: &[&[u8]],
     dsa_sks: &[&[u8]],
+    out: &mut [u8],
+) -> Result<usize, &'static str>;
+
+pub fn cut(
+    packet: &[u8],
+    kem_sks: &[&[u8]],
+    dsa_pks: &[&[u8]],
     out: &mut [u8],
 ) -> Result<usize, &'static str>;
 ```

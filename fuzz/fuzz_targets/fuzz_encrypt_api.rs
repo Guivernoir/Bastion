@@ -1,6 +1,6 @@
 #![no_main]
 
-use crypto_bastion::{compare, encrypt};
+use crypto_bastion::{compare, decrypt, encrypt};
 use libfuzzer_sys::fuzz_target;
 
 fn expand<const N: usize>(data: &[u8], seed: u8) -> [u8; N] {
@@ -43,5 +43,16 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(len1, len2);
         assert!(compare(&ct1[..len1], &ct2[..len2]));
         assert!(compare(&tag1, &tag2));
+
+        let mut pt_out = vec![0u8; len1];
+        let dec = decrypt(&key, &nonce, &aad, &ct1[..len1], &tag1, &mut pt_out);
+        if let Ok(pt_len) = dec {
+            assert_eq!(pt_len, pt.len());
+            assert!(compare(&pt_out[..pt_len], &pt[..]));
+        }
+
+        let mut bad_tag = tag1;
+        bad_tag[0] ^= 0x01;
+        let _ = decrypt(&key, &nonce, &aad, &ct1[..len1], &bad_tag, &mut pt_out);
     }
 });

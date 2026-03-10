@@ -2,12 +2,17 @@
 //!
 //! Public APIs:
 //! - [`encrypt`]: AES-256-GCM encrypt
+//! - [`decrypt`]: AES-256-GCM decrypt
 //! - [`encapsulate`]: ML-KEM-1024 encapsulate
+//! - [`decapsulate`]: ML-KEM-1024 decapsulate
 //! - [`sign`]: ML-DSA-87 detached signature
+//! - [`verify`]: ML-DSA-87 signature verification
 //! - [`hash`]: SHA-512 digest
 //! - [`compare`]: constant-time byte-slice equality
 //! - [`layer_encrypt`]: fixed 3-layer hybrid onion
+//! - [`layer_decrypt`]: fixed 3-layer reverse onion peel
 //! - [`onion`]: variable-layer hybrid onion
+//! - [`cut`]: variable-layer reverse onion peel
 
 #![allow(unsafe_code)]
 #![allow(dead_code)]
@@ -37,8 +42,12 @@ use std::time::Instant;
 
 /// ML-KEM-1024 public key size (bytes).
 pub(crate) const KEM_PK_SIZE: usize = pqc::KEM_PK_SIZE;
+/// ML-KEM-1024 secret key size (bytes).
+pub(crate) const KEM_SK_SIZE: usize = pqc::KEM_SK_SIZE;
 /// ML-KEM-1024 ciphertext size (bytes).
 pub(crate) const KEM_CT_SIZE: usize = pqc::KEM_CT_SIZE;
+/// ML-DSA-87 public key size (bytes).
+pub(crate) const DSA_PK_SIZE: usize = pqc::DSA_PK_SIZE;
 /// ML-DSA-87 detached signature size (bytes).
 pub(crate) const DSA_SIG_SIZE: usize = pqc::DSA_SIG_SIZE;
 
@@ -50,12 +59,17 @@ pub(crate) const LAYER_OVERHEAD: usize = KEM_CT_SIZE + NONCE_SIZE + TAG_SIZE + D
 
 /// Best-effort timing floors for the public API wrappers (ns).
 const FLOOR_PUBLIC_ENCRYPT_NS: u64 = 50_000;
+const FLOOR_PUBLIC_DECRYPT_NS: u64 = 700_000;
 const FLOOR_PUBLIC_ENCAPSULATE_NS: u64 = 120_000;
+const FLOOR_PUBLIC_DECAPSULATE_NS: u64 = 1_200_000;
 const FLOOR_PUBLIC_SIGN_NS: u64 = 300_000;
+const FLOOR_PUBLIC_VERIFY_NS: u64 = 2_700_000;
 const FLOOR_PUBLIC_HASH_NS: u64 = 40_000;
 const FLOOR_PUBLIC_COMPARE_NS: u64 = 40_000;
 const FLOOR_PUBLIC_LAYER_NS: u64 = 800_000;
+const FLOOR_PUBLIC_LAYER_DECRYPT_NS: u64 = 3_500_000;
 const FLOOR_PUBLIC_ONION_NS: u64 = 800_000;
+const FLOOR_PUBLIC_CUT_NS: u64 = 800_000;
 
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -213,6 +227,69 @@ fn onion_internal_into(
     Ok(total_len)
 }
 
+#[inline]
+fn peel_layer_in_place(packet: &mut [u8], kem_sk: &[u8], dsa_pk: &[u8]) -> Result<usize> {
+    if packet.len() < LAYER_OVERHEAD {
+        return Err(CryptoError::invalid_packet("packet too small"));
+    }
+
+    let ct_len = packet.len() - LAYER_OVERHEAD;
+    let nonce_start = KEM_CT_SIZE;
+    let ct_start = nonce_start + NONCE_SIZE;
+    let ct_end = ct_start + ct_len;
+    let signed_end = ct_end + TAG_SIZE;
+
+    let nonce_arr: [u8; NONCE_SIZE] = packet[nonce_start..nonce_start + NONCE_SIZE]
+        .try_into()
+        .map_err(|_| CryptoError::invalid_packet("invalid nonce length"))?;
+    let tag_arr: [u8; TAG_SIZE] = packet[ct_end..signed_end]
+        .try_into()
+        .map_err(|_| CryptoError::invalid_packet("invalid tag length"))?;
+
+    let kem_ct = &packet[..KEM_CT_SIZE];
+    let signed = &packet[..signed_end];
+    let sig = &packet[signed_end..];
+
+    pqc::dsa_verify(dsa_pk, signed, sig)?;
+
+    let mut aes_key = pqc::kem_decapsulate(kem_ct, kem_sk)?;
+    validate_key_entropy(&aes_key)?;
+
+    packet.copy_within(ct_start..ct_end, 0);
+    let cipher = Aes256Gcm::new(Key256::from_mut_bytes(&mut aes_key));
+    let decrypt_res = cipher
+        .open_in_place(&Nonce(nonce_arr), b"", &mut packet[..ct_len], &tag_arr)
+        .map_err(|_| CryptoError::decryption_failed("AES-GCM auth tag mismatch"));
+
+    zeroize_array(&mut aes_key);
+    decrypt_res?;
+    Ok(ct_len)
+}
+
+fn cut_internal_into(
+    packet: &[u8],
+    kem_sks: &[&[u8]],
+    dsa_pks: &[&[u8]],
+    out: &mut [u8],
+) -> Result<usize> {
+    if kem_sks.is_empty() {
+        return Err(CryptoError::internal("at least one layer is required"));
+    }
+    if kem_sks.len() != dsa_pks.len() {
+        return Err(CryptoError::internal("kem_sks and dsa_pks length mismatch"));
+    }
+    if out.len() < packet.len() {
+        return Err(CryptoError::invalid_packet("output buffer too small"));
+    }
+
+    out[..packet.len()].copy_from_slice(packet);
+    let mut cur_len = packet.len();
+    for i in 0..kem_sks.len() {
+        cur_len = peel_layer_in_place(&mut out[..cur_len], kem_sks[i], dsa_pks[i])?;
+    }
+    Ok(cur_len)
+}
+
 /// AES-256-GCM encrypt with caller-supplied key/nonce/AAD.
 pub fn encrypt(
     key: &[u8; 32],
@@ -249,6 +326,38 @@ pub fn encrypt(
     result
 }
 
+/// AES-256-GCM decrypt with caller-supplied key/nonce/AAD/tag.
+pub fn decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+    plaintext_out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+
+    let mut key_buf = [0u8; 32];
+    ct_copy_if(true, key, &mut key_buf);
+
+    let out_ok = plaintext_out.len() >= ciphertext.len();
+    let result = if out_ok {
+        let out = &mut plaintext_out[..ciphertext.len()];
+        out.copy_from_slice(ciphertext);
+
+        let gcm = Aes256Gcm::new(Key256::from_mut_bytes(&mut key_buf));
+        gcm.open_in_place(&Nonce(*nonce), aad, out, tag)
+            .map(|_| ciphertext.len())
+            .map_err(|_| "decryption failed")
+    } else {
+        Err("plaintext output buffer too small")
+    };
+
+    zeroize_array(&mut key_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_DECRYPT_NS);
+    result
+}
+
 /// ML-KEM-1024 encapsulation.
 pub fn encapsulate(
     pk: &[u8],
@@ -275,6 +384,47 @@ pub fn encapsulate(
     result
 }
 
+/// ML-KEM-1024 decapsulation.
+pub fn decapsulate(
+    sk: &[u8],
+    ct: &[u8],
+    ss_out: &mut [u8; 32],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
+
+    let sk_ok = sk.len() == KEM_SK_SIZE;
+    let ct_ok = ct.len() == KEM_CT_SIZE;
+    let len_ok = sk_ok && ct_ok;
+
+    let mut sk_buf = [0u8; KEM_SK_SIZE];
+    let mut ct_buf = [0u8; KEM_CT_SIZE];
+    ct_copy_if(sk_ok, sk, &mut sk_buf);
+    ct_copy_if(ct_ok, ct, &mut ct_buf);
+
+    let decap_res = pqc::kem_decapsulate(&ct_buf, &sk_buf);
+    let result = if len_ok {
+        match decap_res {
+            Ok(mut ss) => {
+                ss_out.copy_from_slice(&ss);
+                zeroize_array(&mut ss);
+                Ok(())
+            }
+            Err(_) => {
+                zeroize_array(ss_out);
+                Err("decapsulation failed")
+            }
+        }
+    } else {
+        zeroize_array(ss_out);
+        Err("decapsulation failed")
+    };
+
+    zeroize_array(&mut sk_buf);
+    zeroize_array(&mut ct_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_DECAPSULATE_NS);
+    result
+}
+
 /// ML-DSA-87 detached signature.
 pub fn sign(
     sk: &[u8],
@@ -298,6 +448,27 @@ pub fn sign(
     zeroize_array(&mut sk_buf);
     enforce_public_floor(start, FLOOR_PUBLIC_SIGN_NS);
     result
+}
+
+/// ML-DSA-87 detached signature verification.
+pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let start = Instant::now();
+
+    let pk_ok = pk.len() == DSA_PK_SIZE;
+    let sig_ok = sig.len() == DSA_SIG_SIZE;
+    let len_ok = pk_ok && sig_ok;
+
+    let mut pk_buf = [0u8; DSA_PK_SIZE];
+    let mut sig_buf = [0u8; DSA_SIG_SIZE];
+    ct_copy_if(pk_ok, pk, &mut pk_buf);
+    ct_copy_if(sig_ok, sig, &mut sig_buf);
+
+    let valid = pqc::dsa_verify(&pk_buf, msg, &sig_buf).is_ok();
+
+    zeroize_array(&mut pk_buf);
+    zeroize_array(&mut sig_buf);
+    enforce_public_floor(start, FLOOR_PUBLIC_VERIFY_NS);
+    len_ok && valid
 }
 
 /// SHA-512 digest.
@@ -330,6 +501,20 @@ pub fn layer_encrypt(
     result
 }
 
+/// Peel exactly 3 hybrid layers (reverse onion).
+pub fn layer_decrypt(
+    packet: &[u8],
+    kem_sks: [&[u8]; 3],
+    dsa_pks: [&[u8]; 3],
+    out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+    let result =
+        cut_internal_into(packet, &kem_sks, &dsa_pks, out).map_err(|_| "layer decrypt failed");
+    enforce_public_floor(start, FLOOR_PUBLIC_LAYER_DECRYPT_NS);
+    result
+}
+
 /// Apply N hybrid onion layers (N is user-defined).
 pub fn onion(
     plaintext: &[u8],
@@ -341,5 +526,18 @@ pub fn onion(
     let result = onion_internal_into(plaintext, kem_pks, dsa_sks, out)
         .map_err(|_| "onion encryption failed");
     enforce_public_floor(start, FLOOR_PUBLIC_ONION_NS);
+    result
+}
+
+/// Peel N hybrid onion layers (N is user-defined).
+pub fn cut(
+    packet: &[u8],
+    kem_sks: &[&[u8]],
+    dsa_pks: &[&[u8]],
+    out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+    let result = cut_internal_into(packet, kem_sks, dsa_pks, out).map_err(|_| "cut failed");
+    enforce_public_floor(start, FLOOR_PUBLIC_CUT_NS);
     result
 }

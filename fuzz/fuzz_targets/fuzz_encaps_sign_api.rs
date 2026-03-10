@@ -1,6 +1,6 @@
 #![no_main]
 
-use crypto_bastion::{encapsulate, hash, sign};
+use crypto_bastion::{decapsulate, encapsulate, hash, sign, verify};
 use libfuzzer_sys::fuzz_target;
 
 fn expand_vec(data: &[u8], len: usize, seed: u8) -> Vec<u8> {
@@ -17,6 +17,8 @@ fn expand_vec(data: &[u8], len: usize, seed: u8) -> Vec<u8> {
 
 fuzz_target!(|data: &[u8]| {
     let kem_pk = expand_vec(data, 1568, 0x31);
+    let kem_sk = expand_vec(data, 3168, 0x41);
+    let dsa_pk = expand_vec(data, 2592, 0x47);
     let dsa_sk = expand_vec(data, 4896, 0x53);
 
     let msg_len = if data.is_empty() {
@@ -34,10 +36,12 @@ fuzz_target!(|data: &[u8]| {
     if encapsulate(&kem_pk, &mut ct, &mut ss).is_ok() {
         let _ = hash(&ct);
         let _ = hash(&ss);
+        let _ = decapsulate(&kem_sk, &ct, &mut ss);
     }
 
     let mut sig = [0u8; 4627];
     if sign(&dsa_sk, &msg, &mut sig).is_ok() {
         let _ = hash(&sig);
+        let _ = verify(&dsa_pk, &msg, &sig);
     }
 });
