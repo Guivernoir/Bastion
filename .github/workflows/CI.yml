@@ -32,6 +32,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f fuzz/Cargo.lock
+
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -136,6 +141,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f fuzz/Cargo.lock
+
       - name: Setup Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
 
@@ -177,6 +187,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Validate lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f fuzz/Cargo.lock
 
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable

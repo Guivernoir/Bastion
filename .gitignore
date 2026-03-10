@@ -1,7 +1,6 @@
 /target/
 /results.txt
 /criterion/
-Cargo.lock
 
 # Fuzzing artifacts
 /fuzz/target/
