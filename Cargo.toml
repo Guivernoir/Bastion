@@ -16,7 +16,7 @@ keywords = [
     "security",
 ]
 categories = ["cryptography", "network-programming"]
-rust-version = "1.90"
+rust-version = "1.92"
 exclude = [
     "target/*",
     "fuzz/target/*",

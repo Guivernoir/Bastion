@@ -1,0 +1,206 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardened-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    name: Verify (Stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-v1
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build checks
+        run: cargo check --locked --all-targets
+
+      - name: Lint (correctness gate)
+        run: |
+          cargo clippy --locked --all-targets -- \
+            -D clippy::correctness \
+            -A clippy::unwrap_used \
+            -A clippy::panic \
+            -A clippy::print_stdout \
+            -A clippy::print_stderr
+
+      - name: Unit and integration tests
+        run: cargo test --locked --all-targets
+
+      - name: NIST/FIPS/SP800 vector gates
+        run: |
+          cargo test --locked nist --all-targets
+          cargo test --locked fips --all-targets
+          cargo test --locked sp800 --all-targets
+
+      - name: Public API contract
+        run: |
+          set -euo pipefail
+          expected=(compare cut decapsulate decrypt encapsulate encrypt hash layer_decrypt layer_encrypt onion sign verify)
+          mapfile -t actual < <(grep -nE '^pub fn ' src/lib.rs | sed -E 's/.*pub fn ([A-Za-z0-9_]+).*/\1/' | sort)
+          printf '%s\n' "${actual[@]}" > /tmp/actual_api.txt
+          printf '%s\n' "${expected[@]}" | sort > /tmp/expected_api.txt
+          diff -u /tmp/expected_api.txt /tmp/actual_api.txt
+
+      - name: Runtime dependency policy
+        run: |
+          set -euo pipefail
+          cargo tree -e normal --prefix none > /tmp/runtime_tree.txt
+          non_empty="$(grep -cve '^[[:space:]]*$' /tmp/runtime_tree.txt)"
+          if [ "$non_empty" -ne 1 ]; then
+            echo "Unexpected runtime dependencies detected:"
+            cat /tmp/runtime_tree.txt
+            exit 1
+          fi
+
+      - name: Benchmark compile smoke
+        run: cargo bench --locked --bench public_api --no-run
+
+      - name: Generate hardening report
+        run: cargo run --locked --example write_results
+
+      - name: Enforce report policy
+        run: |
+          set -euo pipefail
+          test -f results.txt
+
+          if grep -nE 'expected_zero_alloc=FAIL' results.txt; then
+            echo 'Hardening report contains allocation failures.'
+            exit 1
+          fi
+
+          for section in \
+            '[decrypt/1k]' '[decapsulate]' '[verify/256b]' '[layer_decrypt/3]' '[cut/2]' \
+            '[ct/decrypt]' '[ct/decapsulate]' '[ct/verify]' '[ct/layer_decrypt]' '[ct/cut]'
+          do
+            grep -Fq "$section" results.txt
+          done
+
+          # Timing on shared CI runners is noisy. Gate only catastrophic spread.
+          max_ratio_ppm=3000000
+          while IFS= read -r ratio; do
+            if [ "$ratio" -gt "$max_ratio_ppm" ]; then
+              echo "CT spread too large: ratio_ppm=$ratio (limit=$max_ratio_ppm)"
+              exit 1
+            fi
+          done < <(grep -E '^ratio_ppm=' results.txt | sed -E 's/^ratio_ppm=([0-9]+).*/\1/')
+
+      - name: Upload hardening report
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardened-results
+          path: results.txt
+          if-no-files-found: error
+
+  fuzz-smoke:
+    name: Fuzz Smoke (Nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-fuzz-v1
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Build fuzz targets
+        run: |
+          cargo +nightly fuzz build fuzz_hash_compare
+          cargo +nightly fuzz build fuzz_encrypt_api
+          cargo +nightly fuzz build fuzz_encaps_sign_api
+          cargo +nightly fuzz build fuzz_onion_api
+
+      - name: Run fuzz smoke
+        run: |
+          set -euo pipefail
+          cargo +nightly fuzz run fuzz_hash_compare -- -runs=300 -max_total_time=15
+          cargo +nightly fuzz run fuzz_encrypt_api -- -runs=300 -max_total_time=15
+          cargo +nightly fuzz run fuzz_encaps_sign_api -- -runs=300 -max_total_time=15
+          cargo +nightly fuzz run fuzz_onion_api -- -runs=300 -max_total_time=15
+
+  release:
+    name: Release (Tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - verify
+      - fuzz-smoke
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-v1
+
+      - name: Regenerate report for release artifact
+        run: cargo run --locked --example write_results
+
+      - name: Package release bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp results.txt dist/results.txt
+          cp README.md SECURITY.md Cargo.toml Cargo.lock dist/
+          tar -czf "dist/crypto_bastion-${GITHUB_REF_NAME}.tar.gz" \
+            README.md SECURITY.md Cargo.toml Cargo.lock src benches examples fuzz
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/results.txt
+            dist/crypto_bastion-${{ github.ref_name }}.tar.gz
