@@ -134,3 +134,16 @@ pub(crate) fn shake128_xof_init(rho: &[u8; 32], i: u8, j: u8) -> KeccakSponge<RA
     s.finalize(SHAKE_SUFFIX);
     s
 }
+
+/// SHAKE-128 over a single input slice, producing exactly `out.len()` bytes.
+///
+/// Used by MLSigcrypt-v2 level 2 to derive the shared public matrix seed `ρ`
+/// from the secret `matrix_seed`.
+#[inline]
+pub(crate) fn shake128(data: &[u8], out: &mut [u8]) {
+    let mut s: KeccakSponge<RATE_168> = KeccakSponge::new();
+    s.absorb(data);
+    s.finalize(SHAKE_SUFFIX);
+    s.squeeze(out);
+    zeroize_sponge(&mut s);
+}

@@ -1,7 +1,7 @@
-//! MLSigcrypt-v2 phase-1 parameter constants.
+//! MLSigcrypt-v2 level-2 parameter constants.
 //!
-//! This profile keeps the existing key hierarchy and key encodings, but
-//! replaces the old HKDF + AES-GCM packet path with a two-SHAKE construction.
+//! The packet format remains the same as MLSigcrypt-v2 level 1; the level-2
+//! change is the shared-matrix key hierarchy used by key generation.
 
 /// Protocol identifier string, ASCII, no null terminator.
 pub(super) const ALG_ID: &[u8] = b"MLSigcrypt-v2";

@@ -41,12 +41,15 @@ The MLSigcrypt-v2 packet path does not use AES-256-GCM or HKDF.
 
 ## Compliance Note
 
-- MLSigcrypt-v2 phase-1 uses a custom SHAKE-256 composition for packet
-  protection.
+- MLSigcrypt-v2 level 2 uses a custom SHAKE-256 composition for packet
+  protection and a shared-matrix key hierarchy for ML-KEM/ML-DSA key
+  generation.
 - The crate uses standardized PQC primitives, but the overall packet
   construction is not a FIPS 140-3 validated AEAD module.
 - Consumers that require only formally validated FIPS module compositions
   should treat this crate as non-compliant for that requirement.
+- Level-2 keys are intentionally not compatible with earlier MLSigcrypt-v2
+  level-1 keys.
 
 ## Design Controls
 
@@ -75,6 +78,7 @@ signcrypt, and unsigncrypt flows.
 Controls include:
 
 - master-secret zeroization in key generation
+- zeroization of temporary `matrix_seed`-derived material during level-2 key generation
 - zeroize-on-drop wrappers for transcript, shared-secret copies, sponge output
   blocks, and signing randomness
 - defensive wipe of public output buffers on public API failure
@@ -95,6 +99,8 @@ microarchitectural constant-time proofs.
   empty).
 - Public cryptographic operations use caller-owned buffers instead of returning
   heap-backed containers.
+- Level-2 public keys keep the same wire size; secret keys grow to carry the
+  MLSigcrypt `matrix_seed`.
 - `examples/write_results.rs` measures allocator activity, RSS deltas, and
   timing spread for the public API.
 
@@ -158,7 +164,7 @@ cargo +nightly fuzz run fuzz_mlsigcrypt_api -- -max_total_time=30
 
 - Timing-floor normalization is not a full side-channel proof.
 - Fuzzing is coverage-guided and time-bounded unless extended by the operator.
-- MLSigcrypt-v2 phase-1 is not a FIPS 140-3 validated packet construction.
+- MLSigcrypt-v2 level 2 is not a FIPS 140-3 validated packet construction.
 
 ## Disclosure Policy
 

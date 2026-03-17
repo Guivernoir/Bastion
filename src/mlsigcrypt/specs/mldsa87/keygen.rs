@@ -51,14 +51,51 @@ pub(crate) fn keypair(pk: &mut [u8; PK_BYTES], sk: &mut [u8; SK_BYTES], seed: &[
     let mut rho_prime: [u8; 64] = expanded[32..96].try_into().unwrap();
     let mut k_seed: [u8; 32] = expanded[96..128].try_into().unwrap();
 
+    keypair_from_rho(pk, sk, &rho, &mut rho_prime, &mut k_seed);
+
+    zeroize_array(&mut expanded);
+    zeroize_array(&mut rho_prime);
+    zeroize_array(&mut k_seed);
+}
+
+/// Generate an ML-DSA-87 key pair using a caller-supplied public matrix seed `ρ`.
+///
+/// MLSigcrypt-v2 level 2 uses this entry point so the signature and KEM keys
+/// share the same public matrix. Secret sampling remains derived from `seed`.
+pub(crate) fn keypair_with_rho(
+    pk: &mut [u8; PK_BYTES],
+    sk: &mut [u8; SK_BYTES],
+    seed: &[u8; 32],
+    rho: &[u8; 32],
+) {
+    let mut expanded = [0u8; 96];
+    shake256_absorb_squeeze(&[seed.as_slice(), &[K as u8, L as u8]], &mut expanded);
+
+    let mut rho_prime: [u8; 64] = expanded[0..64].try_into().unwrap();
+    let mut k_seed: [u8; 32] = expanded[64..96].try_into().unwrap();
+
+    keypair_from_rho(pk, sk, rho, &mut rho_prime, &mut k_seed);
+
+    zeroize_array(&mut expanded);
+    zeroize_array(&mut rho_prime);
+    zeroize_array(&mut k_seed);
+}
+
+fn keypair_from_rho(
+    pk: &mut [u8; PK_BYTES],
+    sk: &mut [u8; SK_BYTES],
+    rho: &[u8; 32],
+    rho_prime: &mut [u8; 64],
+    k_seed: &mut [u8; 32],
+) {
     // ── Step 2: Generate public matrix A in NTT domain ────────────────────────
     let mut mat_a = PolyMatrix::zero();
-    expand_a(&mut mat_a, &rho);
+    expand_a(&mut mat_a, rho);
 
     // ── Step 3: Sample secret vectors s1 (L) and s2 (K) ──────────────────────
     let mut s1: PolyVec<L> = PolyVec::zero();
     let mut s2: PolyVec<K> = PolyVec::zero();
-    expand_s(&mut s1, &mut s2, &rho_prime);
+    expand_s(&mut s1, &mut s2, rho_prime);
 
     // ── Step 4: t = INTT(A × NTT(s1)) + s2 ──────────────────────────────────
     //
@@ -91,14 +128,14 @@ pub(crate) fn keypair(pk: &mut [u8; PK_BYTES], sk: &mut [u8; SK_BYTES], seed: &[
     }
 
     // ── Step 6: Pack public key ───────────────────────────────────────────────
-    pack_pk(pk, &rho, &t1);
+    pack_pk(pk, rho, &t1);
 
     // ── Step 7: tr = H(pk, 64 bytes) ─────────────────────────────────────────
     let mut tr = [0u8; 64];
     shake256_absorb_squeeze(&[pk.as_slice()], &mut tr);
 
     // ── Step 8: Pack secret key ───────────────────────────────────────────────
-    pack_sk(sk, &rho, &k_seed, &tr, &s1, &s2, &t0);
+    pack_sk(sk, rho, k_seed, &tr, &s1, &s2, &t0);
 
     // ── Zeroize all sensitive intermediates ───────────────────────────────────
     zeroize_polyvec(&mut s1);
@@ -107,8 +144,5 @@ pub(crate) fn keypair(pk: &mut [u8; PK_BYTES], sk: &mut [u8; SK_BYTES], seed: &[
     zeroize_polyvec(&mut w_hat);
     zeroize_polyvec(&mut t);
     zeroize_polyvec(&mut t0);
-    zeroize_array(&mut expanded);
-    zeroize_array(&mut rho_prime);
     zeroize_array(&mut tr);
-    zeroize_array(&mut k_seed);
 }

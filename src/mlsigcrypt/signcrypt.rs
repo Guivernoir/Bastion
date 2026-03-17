@@ -1,9 +1,10 @@
-/// MLSigcrypt-v2 phase-1 signcrypt and unsigncrypt algorithms.
+/// MLSigcrypt-v2 level-2 signcrypt and unsigncrypt algorithms.
 ///
 /// ## Signcrypt
 ///
 /// 1. Validate sender and recipient public identities.
-/// 2. ML-KEM-1024 encapsulation -> `(kem_ct, κ)`.
+/// 2. ML-KEM-1024 encapsulation -> `(kem_ct, κ)` using a level-2 key derived
+///    from the shared lattice matrix.
 /// 3. SHA3-512("MLSigcrypt-v2/aad\x02" || aad) -> `aad_digest`.
 /// 4. Build `S_E` from `κ`, `key_id_S`, `key_id_R`, and `kem_ct`.
 /// 5. XOR the SHAKE-256 keystream into the payload buffer to produce `ct`.

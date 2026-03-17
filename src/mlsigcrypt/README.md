@@ -1,12 +1,12 @@
 # MLSigcrypt Internal Layout
 
-This directory contains the internal MLSigcrypt-v2 protocol code plus the
-primitive implementations it depends on.
+This directory contains the internal MLSigcrypt-v2 level-2 protocol code plus
+the primitive implementations it depends on.
 
 ## Root Modules
 
-- `mod.rs` — MLSigcrypt-v2 module root, integration tests, and byte-buffer entry points
-- `keys.rs` — unified identity key types, encoding, decoding, and deterministic key derivation
+- `mod.rs` — MLSigcrypt-v2 level-2 module root, integration tests, and byte-buffer entry points
+- `keys.rs` — unified identity key types, level-2 encoding, and shared-matrix key derivation
 - `params.rs` — protocol constants, sizes, offsets, and packet layout
 - `signcrypt.rs` — signcrypt / unsigncrypt packet processing
 - `specs/` — primitive implementations and supporting spec-level helpers
@@ -28,6 +28,7 @@ Public API entry points remain in `src/lib.rs`.
 - Fixed-size arrays are preferred for secret state and wire-format fields.
 - Sensitive intermediates are explicitly zeroized.
 - Protocol logic is kept at the `mlsigcrypt/` root; primitive logic stays under `specs/`.
+- Level-2 key generation derives a shared public matrix for ML-KEM and ML-DSA from one secret `matrix_seed`.
 - Tests cover known-answer vectors, tamper rejection, roundtrips, and layout invariants.
 
 ## Verification Workflow

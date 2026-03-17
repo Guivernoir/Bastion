@@ -81,6 +81,20 @@ pub(crate) fn keygen(seed: &[u8; KEYGEN_SEED_BYTES], ek: &mut EncapKey, dk: &mut
     kem::keygen(seed, ek, dk);
 }
 
+/// Generate an ML-KEM-1024 key pair using a caller-supplied public matrix seed.
+///
+/// This is used by MLSigcrypt-v2 level 2 so the KEM and DSA keys share the
+/// same matrix `ρ`.
+#[inline]
+pub(crate) fn keygen_with_rho(
+    seed: &[u8; KEYGEN_SEED_BYTES],
+    rho: &[u8; 32],
+    ek: &mut EncapKey,
+    dk: &mut DecapKey,
+) {
+    kem::keygen_with_rho(seed, rho, ek, dk);
+}
+
 /// Encapsulate to the holder of `ek`.
 ///
 /// `entropy` must be 32 bytes of uniform randomness.

@@ -34,7 +34,7 @@ pub(crate) mod verify;
 // ── Re-export the primary API ─────────────────────────────────────────────────
 
 #[allow(unused_imports)]
-pub(crate) use keygen::keypair;
+pub(crate) use keygen::{keypair, keypair_with_rho};
 #[allow(unused_imports)]
 pub(crate) use sign::sign;
 #[allow(unused_imports)]

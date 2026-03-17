@@ -1,18 +1,19 @@
-/// MLSigcrypt-v2 phase-1 — outsider-verifiable post-quantum signcryption.
+/// MLSigcrypt-v2 level 2 — outsider-verifiable post-quantum signcryption.
 ///
 /// # Purpose
 ///
-/// MLSigcrypt-v2 phase-1 keeps the existing unified ML-KEM-1024 + ML-DSA-87
-/// key hierarchy and key encodings, but replaces the v1 packet path with a
-/// two-sponge SHAKE-256 construction:
+/// MLSigcrypt-v2 level 2 keeps the level-1 packet path but changes key
+/// generation so ML-KEM-1024 and ML-DSA-87 share a single public matrix:
 ///
+/// - `matrix_seed` expands to a shared public `ρ`, reused by both lattice
+///   components during key generation
 /// - `S_E` produces the payload keystream from `κ`, sender/recipient `key_id`,
 ///   and `kem_ct`
 /// - `S_T` absorbs the authenticated public transcript and ciphertext to derive
 ///   the 64-byte signing transcript `T`
 ///
-/// The v2 signcrypt path is built only from SHAKE-256, ML-KEM-1024, and
-/// ML-DSA-87.
+/// The wire packet format stays unchanged, but level-2 keys are not compatible
+/// with earlier MLSigcrypt-v2 level-1 keys.
 ///
 /// # Packet format
 ///

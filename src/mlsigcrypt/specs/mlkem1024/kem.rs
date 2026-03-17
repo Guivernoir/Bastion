@@ -101,6 +101,42 @@ pub(crate) fn keygen(seed: &[u8; KEYGEN_SEED_BYTES], ek: &mut EncapKey, dk: &mut
     let rho: &[u8; 32] = unsafe { &*(g_out.as_ptr() as *const [u8; 32]) };
     let sigma: &[u8; 32] = unsafe { &*(g_out.as_ptr().add(32) as *const [u8; 32]) };
 
+    keygen_from_rho_sigma(rho, sigma, z, ek, dk);
+
+    // SAFETY: `g_out` is a valid writable array.
+    unsafe { zeroize_mem(g_out.as_mut_ptr(), g_out.len()) };
+}
+
+/// ML-KEM.KeyGen with an externally supplied public matrix seed `ρ`.
+///
+/// MLSigcrypt-v2 level 2 uses this entry point so the KEM and DSA keys share
+/// the same public matrix. Secret sampling remains derived from `seed`.
+pub(crate) fn keygen_with_rho(
+    seed: &[u8; KEYGEN_SEED_BYTES],
+    rho: &[u8; 32],
+    ek: &mut EncapKey,
+    dk: &mut DecapKey,
+) {
+    let d = &seed[..32];
+    let z = &seed[32..];
+
+    let mut g_out = [0u8; 64];
+    sha3_512_x2(d, &[K as u8], &mut g_out);
+    let sigma: &[u8; 32] = unsafe { &*(g_out.as_ptr().add(32) as *const [u8; 32]) };
+
+    keygen_from_rho_sigma(rho, sigma, z, ek, dk);
+
+    // SAFETY: `g_out` is a valid writable array.
+    unsafe { zeroize_mem(g_out.as_mut_ptr(), g_out.len()) };
+}
+
+fn keygen_from_rho_sigma(
+    rho: &[u8; 32],
+    sigma: &[u8; 32],
+    z: &[u8],
+    ek: &mut EncapKey,
+    dk: &mut DecapKey,
+) {
     // 2. Generate public matrix A from ρ.
     let mut a_hat = PolyMatrix::zero();
     gen_matrix(&mut a_hat, rho, false); // A (not transposed)
@@ -157,8 +193,6 @@ pub(crate) fn keygen(seed: &[u8; KEYGEN_SEED_BYTES], ek: &mut EncapKey, dk: &mut
     // ── Zeroize secrets ───────────────────────────────────────────────────────
     zeroize_polyvec(&mut s);
     zeroize_polyvec(&mut e);
-    // SAFETY: `g_out` is a valid writable array.
-    unsafe { zeroize_mem(g_out.as_mut_ptr(), g_out.len()) };
     // t_hat, a_hat are public values; no need to zeroize.
 }
 

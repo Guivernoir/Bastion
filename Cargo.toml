@@ -1,6 +1,6 @@
 [package]
 name = "crypto_bastion"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
 license = "MIT OR Apache-2.0"
