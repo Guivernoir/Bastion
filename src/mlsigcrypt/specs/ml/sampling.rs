@@ -7,10 +7,10 @@
 ///
 /// All XOF state is zeroized after use. Sensitive inputs (σ, K, ρ') are zeroized
 /// in the caller (sign.rs); this module only sees them transiently.
-use crate::mlsigcrypt::specs::mldsa87::matrix::PolyMatrix;
-use crate::mlsigcrypt::specs::mldsa87::params::{ETA, GAMMA1, K, L, LAMBDA2_BYTES, N, Q, TAU};
-use crate::mlsigcrypt::specs::mldsa87::poly::Poly;
-use crate::mlsigcrypt::specs::mldsa87::vec::PolyVec;
+use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
+use crate::mlsigcrypt::specs::ml::params::{ETA, GAMMA1, K, L, LAMBDA2_BYTES, N, Q, TAU};
+use crate::mlsigcrypt::specs::ml::poly::Poly;
+use crate::mlsigcrypt::specs::ml::vec::PolyVec;
 
 // ── Rate constants ────────────────────────────────────────────────────────────
 
@@ -18,10 +18,10 @@ const SHAKE128_RATE: usize = 168;
 const SHAKE256_RATE: usize = 136;
 
 // ── Local KeccakSponge access ─────────────────────────────────────────────────
-// We borrow the sponge infrastructure from the ML-KEM keccak module.
-// All usage is via absorb/squeeze; domain separation bytes are different.
+// MLSigcrypt shares a single internal Keccak sponge implementation across the
+// hash, XOF, and signing modules.
 
-use crate::mlsigcrypt::specs::mlkem1024::keccak::{KeccakSponge, zeroize_sponge};
+use crate::mlsigcrypt::specs::keccak::{KeccakSponge, zeroize_sponge};
 
 const SHAKE_SUFFIX: u8 = 0x1F;
 

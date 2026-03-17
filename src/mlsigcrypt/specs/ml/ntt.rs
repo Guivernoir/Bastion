@@ -19,8 +19,8 @@
 /// from the Montgomery arithmetic. ⚠ Verify against FIPS 204 KAT vectors before deployment.
 ///
 /// Reference: crystals-dilithium reference implementation, ntt.c (public domain).
-use crate::mlsigcrypt::specs::mldsa87::field::{fqmul, montgomery_reduce};
-use crate::mlsigcrypt::specs::mldsa87::params::N;
+use crate::mlsigcrypt::specs::ml::field::{fqmul, montgomery_reduce};
+use crate::mlsigcrypt::specs::ml::params::N;
 
 // ── Zeta table ────────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ pub(crate) fn poly_pointwise_acc(a: &[i32; N], b: &[i32; N], out: &mut [i32; N])
 #[inline]
 pub(crate) fn poly_reduce(a: &mut [i32; N]) {
     for c in a.iter_mut() {
-        *c = crate::mlsigcrypt::specs::mldsa87::field::reduce32(*c);
+        *c = crate::mlsigcrypt::specs::ml::field::reduce32(*c);
     }
 }
 
@@ -161,6 +161,6 @@ pub(crate) fn poly_reduce(a: &mut [i32; N]) {
 #[inline]
 pub(crate) fn poly_caddq(a: &mut [i32; N]) {
     for c in a.iter_mut() {
-        *c = crate::mlsigcrypt::specs::mldsa87::field::caddq(*c);
+        *c = crate::mlsigcrypt::specs::ml::field::caddq(*c);
     }
 }

@@ -1,4 +1,4 @@
-use crate::mlsigcrypt::specs::mldsa87::ntt::poly_pointwise_acc;
+use crate::mlsigcrypt::specs::ml::ntt::poly_pointwise_acc;
 /// K×L polynomial matrix for ML-DSA-87.
 ///
 /// The public matrix A is generated in NTT domain from seed ρ and never leaves it.
@@ -9,8 +9,8 @@ use crate::mlsigcrypt::specs::mldsa87::ntt::poly_pointwise_acc;
 /// Indexing: rows[i].polys[j] = A[i][j], i ∈ [0,K), j ∈ [0,L).
 ///
 /// A is public — no zeroization required.
-use crate::mlsigcrypt::specs::mldsa87::params::{K, L, N};
-use crate::mlsigcrypt::specs::mldsa87::vec::PolyVec;
+use crate::mlsigcrypt::specs::ml::params::{K, L, N};
+use crate::mlsigcrypt::specs::ml::vec::PolyVec;
 
 // ── Type ──────────────────────────────────────────────────────────────────────
 

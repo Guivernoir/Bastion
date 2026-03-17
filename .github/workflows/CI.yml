@@ -94,16 +94,15 @@ jobs:
       - name: Internal clone/copy policy
         run: |
           set -euo pipefail
-          copy_hits="$(grep -REH '#\[derive\([^]]*Copy|impl[[:space:]]+Copy[[:space:]]+for' src/mlsigcrypt src/pqc.rs src/constant_time.rs src/zeroize.rs || true)"
+          copy_hits="$(grep -REH '#\[derive\([^]]*Copy|impl[[:space:]]+Copy[[:space:]]+for' src/mlsigcrypt src/constant_time.rs src/zeroize.rs || true)"
           if [ -n "$copy_hits" ]; then
             echo 'Copy is forbidden in internal crypto modules.'
             printf '%s\n' "$copy_hits"
             exit 1
           fi
 
-          allowed_clone='src/mlsigcrypt/keys.rs:#[derive(Clone)]'
-          clone_hits="$(grep -REH '#\[derive\([^]]*Clone|impl[[:space:]]+Clone[[:space:]]+for' src/mlsigcrypt src/pqc.rs src/constant_time.rs src/zeroize.rs || true)"
-          if [ -n "$clone_hits" ] && [ "$clone_hits" != "$allowed_clone" ]; then
+          clone_hits="$(grep -REH '#\[derive\([^]]*Clone|impl[[:space:]]+Clone[[:space:]]+for' src/mlsigcrypt src/constant_time.rs src/zeroize.rs || true)"
+          if [ -n "$clone_hits" ]; then
             echo 'Unexpected Clone usage in internal crypto modules:'
             printf '%s\n' "$clone_hits"
             exit 1

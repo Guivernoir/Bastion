@@ -5,7 +5,7 @@
 ///
 /// Montgomery domain: R = 2^32.
 /// Barrett domain:    round(a / q) ≈ (a + 2^22) >> 23, exploiting q ≈ 2^23.
-use crate::mlsigcrypt::specs::mldsa87::params::{GAMMA2, Q32, Q64};
+use crate::mlsigcrypt::specs::ml::params::{GAMMA2, Q32, Q64};
 
 // ── Montgomery constants ──────────────────────────────────────────────────────
 
@@ -66,7 +66,7 @@ pub(crate) fn power2round(r: i32) -> (i32, i32) {
     // FIPS / Dilithium reference form:
     //   r1 = floor((r + 2^{d-1} - 1) / 2^d)
     //   r0 = r - r1*2^d
-    let d = crate::mlsigcrypt::specs::mldsa87::params::D;
+    let d = crate::mlsigcrypt::specs::ml::params::D;
     let r1 = (r + (1 << (d - 1)) - 1) >> d;
     let r0 = r - (r1 << d);
     (r1, r0)
@@ -82,7 +82,7 @@ pub(crate) fn power2round(r: i32) -> (i32, i32) {
 /// α = 2γ₂ = (q − 1) / 16. Used for HighBits and LowBits in sign/verify.
 #[inline(always)]
 pub(crate) fn decompose(r: i32) -> (i32, i32) {
-    use crate::mlsigcrypt::specs::mldsa87::params::ALPHA;
+    use crate::mlsigcrypt::specs::ml::params::ALPHA;
 
     let mut r1 = (r + 127) >> 7;
     // Round r1 to nearest multiple of α/2^7; then keep in [0, 15].
@@ -158,7 +158,7 @@ pub(crate) fn chknorm(a: i32, bound: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{decompose, power2round};
-    use crate::mlsigcrypt::specs::mldsa87::params::{D, GAMMA2, Q32};
+    use crate::mlsigcrypt::specs::ml::params::{D, GAMMA2, Q32};
 
     #[test]
     fn power2round_boundary_at_half_interval() {

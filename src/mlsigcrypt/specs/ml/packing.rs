@@ -11,13 +11,13 @@
 ///
 /// Correctness of every layout is verified by the constants in params.rs
 /// (POLYT1_BYTES = 320, POLYT0_BYTES = 416, etc.).
-use crate::mlsigcrypt::specs::mldsa87::params::{
+use crate::mlsigcrypt::specs::ml::params::{
     ETA, GAMMA1, K, L, LAMBDA2_BYTES, N, OMEGA, PK_BYTES, PK_RHO_OFF, PK_T1_OFF, POLYETA_BYTES,
     POLYT0_BYTES, POLYT1_BYTES, POLYW1_BYTES, POLYZ_BYTES, SIG_BYTES, SIG_CTILDE_OFF, SIG_H_OFF,
     SIG_Z_OFF, SK_BYTES, SK_K_OFF, SK_RHO_OFF, SK_S1_OFF, SK_S2_OFF, SK_T0_OFF, SK_TR_OFF,
 };
-use crate::mlsigcrypt::specs::mldsa87::poly::Poly;
-use crate::mlsigcrypt::specs::mldsa87::vec::PolyVec;
+use crate::mlsigcrypt::specs::ml::poly::Poly;
+use crate::mlsigcrypt::specs::ml::vec::PolyVec;
 
 // ── t1 (10 bits/coeff) ────────────────────────────────────────────────────────
 //

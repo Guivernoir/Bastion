@@ -3,7 +3,7 @@ pub(crate) mod keygen;
 pub(crate) mod matrix;
 pub(crate) mod ntt;
 pub(crate) mod packing;
-/// ML-DSA-87 module — NIST security level 5 digital signature scheme.
+/// `ml` module implementing ML-DSA-87, the NIST level-5 digital signature scheme.
 ///
 /// FIPS 204 compliant implementation. Parameter set: K=8, L=7, η=2, γ₁=2^19, γ₂=(q−1)/32, ω=75.
 ///

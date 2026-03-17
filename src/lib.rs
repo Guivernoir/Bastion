@@ -11,12 +11,10 @@
 #![warn(clippy::unwrap_used, clippy::panic)]
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-mod audit;
 mod constant_time;
 mod error;
 mod mlsigcrypt;
 mod os_random;
-mod pqc;
 mod zeroize;
 
 use crate::zeroize::{zeroize_array, zeroize_slice};
@@ -30,9 +28,12 @@ pub const MLSIGCRYPT_SECRET_KEY_SIZE: usize = mlsigcrypt::SECRET_KEY_SIZE;
 pub const MLSIGCRYPT_PACKET_OVERHEAD: usize = mlsigcrypt::PACKET_OVERHEAD;
 
 /// Best-effort timing floors for the public API wrappers (ns).
-const FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS: u64 = 18_000_000;
-const FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS: u64 = 11_500_000;
-const FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS: u64 = 4_000_000;
+///
+/// Key generation is intentionally left unpadded because it has no
+/// adversary-controlled secret-dependent input at the public boundary.
+const FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS: u64 = 0;
+const FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS: u64 = 7_000_000;
+const FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS: u64 = 1_500_000;
 
 #[inline]
 fn enforce_public_floor(start: Instant, floor_ns: u64) {
@@ -57,7 +58,7 @@ pub fn mlsigcrypt_keygen(
         Err(_) => {
             zeroize_array(pk_user_out);
             zeroize_array(sk_user_out);
-            Err("mlsigcrypt-v2 key generation failed")
+            Err("mlsigcrypt-v3 key generation failed")
         }
     };
 
@@ -79,7 +80,7 @@ pub fn mlsigcrypt_signcrypt(
         mlsigcrypt::signcrypt_into(sk_user_sender, pk_user_recipient, aad, message, packet_out)
             .map_err(|_| {
                 zeroize_slice(packet_out);
-                "mlsigcrypt-v2 signcrypt failed"
+                "mlsigcrypt-v3 signcrypt failed"
             });
 
     enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS);
@@ -105,7 +106,7 @@ pub fn mlsigcrypt_unsigncrypt(
     )
     .map_err(|_| {
         zeroize_slice(plaintext_out);
-        "mlsigcrypt-v2 open failed"
+        "mlsigcrypt-v3 open failed"
     });
 
     enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS);
@@ -118,8 +119,8 @@ mod tests {
 
     #[test]
     fn mlsigcrypt_public_api_roundtrip() {
-        let aad = b"bastion-mlsigcrypt-v2";
-        let msg = b"mlsigcrypt-v2 public api roundtrip";
+        let aad = b"bastion-mlsigcrypt-v3";
+        let msg = b"mlsigcrypt-v3 public api roundtrip";
         let mut sender_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];
         let mut sender_sk = [0u8; MLSIGCRYPT_SECRET_KEY_SIZE];
         let mut recipient_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn mlsigcrypt_open_failures_are_unified() {
-        let aad = b"bastion-mlsigcrypt-v2";
+        let aad = b"bastion-mlsigcrypt-v3";
         let msg = b"fail-open";
         let mut sender_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];
         let mut sender_sk = [0u8; MLSIGCRYPT_SECRET_KEY_SIZE];
@@ -163,7 +164,7 @@ mod tests {
 
         let mut tampered = [0u8; MLSIGCRYPT_PACKET_OVERHEAD + 64];
         tampered[..packet_len].copy_from_slice(&packet[..packet_len]);
-        tampered[MLSIGCRYPT_PACKET_OVERHEAD - crate::pqc::DSA_SIG_SIZE] ^= 0x01;
+        tampered[packet_len - 1] ^= 0x01;
 
         assert_eq!(
             mlsigcrypt_unsigncrypt(
@@ -173,7 +174,7 @@ mod tests {
                 &tampered[..packet_len],
                 &mut plaintext,
             ),
-            Err("mlsigcrypt-v2 open failed")
+            Err("mlsigcrypt-v3 open failed")
         );
         assert_eq!(
             mlsigcrypt_unsigncrypt(
@@ -183,7 +184,7 @@ mod tests {
                 &packet[..packet_len],
                 &mut plaintext,
             ),
-            Err("mlsigcrypt-v2 open failed")
+            Err("mlsigcrypt-v3 open failed")
         );
     }
 }

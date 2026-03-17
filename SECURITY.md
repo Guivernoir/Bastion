@@ -24,7 +24,7 @@ guarantees.
 ## Security Objectives
 
 - Preserve confidentiality, integrity, and sender authenticity for
-  MLSigcrypt-v2 packets.
+  MLSigcrypt-v3 packets.
 - Zeroize secret intermediates and defensive output buffers on failure paths.
 - Keep the public interface buffer-oriented and allocation-aware.
 - Minimize observable timing variance at the public wrapper boundary.
@@ -32,24 +32,23 @@ guarantees.
 
 ## Cryptographic Components
 
-- SHAKE-256 for the MLSigcrypt-v2 payload keystream and transcript derivation.
-- ML-KEM-1024 for encapsulation and decapsulation.
-- ML-DSA-87 for outsider-verifiable signatures.
+- SHAKE-256 for the MLSigcrypt-v3 payload keystream and fused challenge derivation.
+- A custom algebraic encapsulation over the ML-DSA ring for packet confidentiality.
+- ML-DSA-87 response/hint machinery for outsider-verifiable authenticity.
 - SHA3-512 for key derivation, key identifiers, and AAD normalization.
 
-The MLSigcrypt-v2 packet path does not use AES-256-GCM or HKDF.
+The MLSigcrypt-v3 packet path does not use AES-256-GCM, HKDF, or ML-KEM.
 
 ## Compliance Note
 
-- MLSigcrypt-v2 level 2 uses a custom SHAKE-256 composition for packet
-  protection and a shared-matrix key hierarchy for ML-KEM/ML-DSA key
-  generation.
+- MLSigcrypt-v3 level 3 uses a custom SHAKE-256 composition plus an algebraic
+  encapsulation field fused with the ML-DSA signing mask.
 - The crate uses standardized PQC primitives, but the overall packet
   construction is not a FIPS 140-3 validated AEAD module.
 - Consumers that require only formally validated FIPS module compositions
   should treat this crate as non-compliant for that requirement.
-- Level-2 keys are intentionally not compatible with earlier MLSigcrypt-v2
-  level-1 keys.
+- Level-3 keys and packets are intentionally not compatible with earlier
+  MLSigcrypt-v2 level-1 or level-2 profiles.
 
 ## Design Controls
 
@@ -78,7 +77,7 @@ signcrypt, and unsigncrypt flows.
 Controls include:
 
 - master-secret zeroization in key generation
-- zeroization of temporary `matrix_seed`-derived material during level-2 key generation
+- zeroization of temporary `matrix_seed`-derived material during level-3 key generation
 - zeroize-on-drop wrappers for transcript, shared-secret copies, sponge output
   blocks, and signing randomness
 - defensive wipe of public output buffers on public API failure
@@ -86,7 +85,7 @@ Controls include:
 ### Constant-Time and Ordering Controls
 
 - `ct_eq` is used for `alg_id`, `key_id_S`, and `key_id_R` packet checks.
-- Signature verification is completed before ML-KEM decapsulation.
+- Signature verification is completed before payload-key recovery.
 - Public wrappers apply timing-floor normalization to reduce interface-level
   signal.
 
@@ -99,8 +98,9 @@ microarchitectural constant-time proofs.
   empty).
 - Public cryptographic operations use caller-owned buffers instead of returning
   heap-backed containers.
-- Level-2 public keys keep the same wire size; secret keys grow to carry the
-  MLSigcrypt `matrix_seed`.
+- The current level-3 implementation uses an exact 23-bit encoding for the
+  recipient encapsulation vector, so packet overhead is 7657 bytes rather than
+  the merge draft's rough compressed estimate.
 - `examples/write_results.rs` measures allocator activity, RSS deltas, and
   timing spread for the public API.
 
@@ -109,14 +109,14 @@ microarchitectural constant-time proofs.
 ### Packet Tampering
 
 - Signature verification binds sender/recipient identities, both public keys,
-  `kem_ct`, normalized AAD, ciphertext length, and ciphertext bytes into the
-  transcript.
+  `encap`, normalized AAD, ciphertext length, and ciphertext bytes into the
+  fused challenge.
 - Modified packets fail with a unified open error.
 
 ### Oracle Abuse / DoS
 
 - Packet shape checks happen before expensive recovery work.
-- ML-KEM decapsulation happens only after a valid signature check.
+- Payload-key recovery happens only after a valid signature check.
 - Public open failures collapse to a single outward error string.
 
 ### Information Disclosure
@@ -164,7 +164,7 @@ cargo +nightly fuzz run fuzz_mlsigcrypt_api -- -max_total_time=30
 
 - Timing-floor normalization is not a full side-channel proof.
 - Fuzzing is coverage-guided and time-bounded unless extended by the operator.
-- MLSigcrypt-v2 level 2 is not a FIPS 140-3 validated packet construction.
+- MLSigcrypt-v3 level 3 is not a FIPS 140-3 validated packet construction.
 
 ## Disclosure Policy
 

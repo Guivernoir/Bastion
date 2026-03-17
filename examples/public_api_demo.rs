@@ -6,7 +6,7 @@ use crypto_bastion::{
 };
 
 fn main() -> Result<(), &'static str> {
-    let aad = b"demo-mlsigcrypt-v2-aad";
+    let aad = b"demo-mlsigcrypt-v3-aad";
     let msg = b"mlsigcrypt public api demo";
 
     let mut sender_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];

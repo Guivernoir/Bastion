@@ -11,13 +11,13 @@
 use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::mlsigcrypt::specs::mldsa87::field::{
+use crate::mlsigcrypt::specs::ml::field::{
     chknorm, high_bits, low_bits, make_hint, power2round, use_hint,
 };
-use crate::mlsigcrypt::specs::mldsa87::ntt::{
+use crate::mlsigcrypt::specs::ml::ntt::{
     inv_ntt, ntt, poly_caddq, poly_pointwise_acc, poly_pointwise_montgomery, poly_reduce,
 };
-use crate::mlsigcrypt::specs::mldsa87::params::{D, N, Q32};
+use crate::mlsigcrypt::specs::ml::params::{D, N, Q32};
 
 // ── Type ──────────────────────────────────────────────────────────────────────
 

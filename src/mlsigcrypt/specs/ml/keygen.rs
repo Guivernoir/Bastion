@@ -1,5 +1,5 @@
-use crate::mlsigcrypt::specs::mldsa87::matrix::PolyMatrix;
-use crate::mlsigcrypt::specs::mldsa87::packing::{pack_pk, pack_sk};
+use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
+use crate::mlsigcrypt::specs::ml::packing::{pack_pk, pack_sk};
 /// ML-DSA-87 key generation — FIPS 204 Algorithm 1.
 ///
 /// # Algorithm
@@ -23,9 +23,9 @@ use crate::mlsigcrypt::specs::mldsa87::packing::{pack_pk, pack_sk};
 /// # Memory note
 /// Stack usage: 1× PolyMatrix (≈56 KB) + several PolyVec<K/L> (≈8 KB each).
 /// On constrained targets, consider splitting or using a static allocation.
-use crate::mlsigcrypt::specs::mldsa87::params::{K, L, PK_BYTES, SK_BYTES};
-use crate::mlsigcrypt::specs::mldsa87::sampling::{expand_a, expand_s, shake256_absorb_squeeze};
-use crate::mlsigcrypt::specs::mldsa87::vec::{PolyVec, zeroize_polyvec};
+use crate::mlsigcrypt::specs::ml::params::{K, L, PK_BYTES, SK_BYTES};
+use crate::mlsigcrypt::specs::ml::sampling::{expand_a, expand_s, shake256_absorb_squeeze};
+use crate::mlsigcrypt::specs::ml::vec::{PolyVec, zeroize_polyvec};
 use crate::zeroize::zeroize_array;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -60,8 +60,9 @@ pub(crate) fn keypair(pk: &mut [u8; PK_BYTES], sk: &mut [u8; SK_BYTES], seed: &[
 
 /// Generate an ML-DSA-87 key pair using a caller-supplied public matrix seed `ρ`.
 ///
-/// MLSigcrypt-v2 level 2 uses this entry point so the signature and KEM keys
-/// share the same public matrix. Secret sampling remains derived from `seed`.
+/// MLSigcrypt shared-matrix profiles use this entry point so the signature key
+/// can be derived against a caller-chosen public matrix. Secret sampling
+/// remains derived from `seed`.
 pub(crate) fn keypair_with_rho(
     pk: &mut [u8; PK_BYTES],
     sk: &mut [u8; SK_BYTES],

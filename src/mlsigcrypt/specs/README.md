@@ -5,10 +5,9 @@ This directory contains the internal primitive implementations consumed by
 
 ## Modules
 
-- `sha3_512.rs` — SHA3-512 sponge hashing for MLSigcrypt transcript-bound operations
-- `sha512.rs` — SHA-512 retained as an internal spec-level implementation
-- `mlkem1024/` — ML-KEM-1024 KEM implementation
-- `mldsa87/` — ML-DSA-87 signature implementation
+- `keccak.rs` — shared Keccak sponge and SHAKE-128 helper used across MLSigcrypt
+- `sha512.rs` — consolidated SHA3-512 and SHA-512 internal hash implementations
+- `ml/` — ML-DSA-87 signature implementation and shared lattice arithmetic
 
 ## Layout Rule
 

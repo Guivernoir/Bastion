@@ -1,42 +1,44 @@
-/// MLSigcrypt-v2 level 2 — outsider-verifiable post-quantum signcryption.
+/// MLSigcrypt-v3 level 3 — algebraic post-quantum signcryption.
 ///
 /// # Purpose
 ///
-/// MLSigcrypt-v2 level 2 keeps the level-1 packet path but changes key
-/// generation so ML-KEM-1024 and ML-DSA-87 share a single public matrix:
+/// MLSigcrypt-v3 level 3 replaces the ML-KEM packet component with an algebraic
+/// encapsulation driven from the same mask vector used by the ML-DSA response:
 ///
-/// - `matrix_seed` expands to a shared public `ρ`, reused by both lattice
-///   components during key generation
-/// - `S_E` produces the payload keystream from `κ`, sender/recipient `key_id`,
-///   and `kem_ct`
-/// - `S_T` absorbs the authenticated public transcript and ciphertext to derive
-///   the 64-byte signing transcript `T`
+/// - `matrix_seed` expands to a per-identity public `ρ_shared`
+/// - the same sampled mask `y` drives both the algebraic encapsulation and the
+///   ML-DSA response generation
+/// - `S_E` produces the payload keystream from the derived message key,
+///   sender/recipient `key_id`, and the `encap` field
 ///
-/// The wire packet format stays unchanged, but level-2 keys are not compatible
-/// with earlier MLSigcrypt-v2 level-1 keys.
+/// The current implementation uses an exact 23-bit encoding for the algebraic
+/// encapsulation vector, so the concrete packet overhead is larger than the
+/// rough estimate in the merge draft.
 ///
 /// # Packet format
 ///
 /// ```text
-/// [13]     alg_id = "MLSigcrypt-v2"
-/// [1]      version = 0x02
+/// [13]     alg_id = "MLSigcrypt-v3"
+/// [1]      version = 0x03
 /// [32]     key_id_S
 /// [32]     key_id_R
-/// [1568]   kem_ct
+/// [2944]   encap
+/// [4480]   z
+/// [64]     c_tilde
+/// [83]     h
 /// [8]      ct_len
 /// [N]      ct
-/// [4627]   sig
 /// ```
 ///
-/// Fixed overhead: 6281 bytes.
+/// Fixed overhead: 7657 bytes.
 ///
 /// # Security invariants
 ///
-/// - Signature verification happens before ML-KEM decapsulation.
+/// - Signature verification happens before payload key recovery.
 /// - `alg_id`, `key_id_S`, and `key_id_R` comparisons on open use constant-time
 ///   equality.
-/// - All transient secret material (`κ`, sponge state, keystream blocks,
-///   signing randomness) is explicitly zeroized.
+/// - All transient secret material (message keys, sponge state, signing
+///   randomness) is explicitly zeroized.
 pub(crate) mod keys;
 pub(crate) mod params;
 pub(crate) mod signcrypt;
@@ -76,9 +78,9 @@ pub(crate) fn signcrypt_into(
     packet_out: &mut [u8],
 ) -> Result<usize> {
     let (sender_sk, sender_pk) = decode_secret_key(sk_user_sender)
-        .ok_or_else(|| CryptoError::internal("invalid MLSigcrypt-v2 secret key length"))?;
+        .ok_or_else(|| CryptoError::internal("invalid MLSigcrypt-v3 secret key length"))?;
     let recipient_pk = decode_public_key(pk_user_recipient).ok_or_else(|| {
-        CryptoError::invalid_public_key("invalid MLSigcrypt-v2 public key length")
+        CryptoError::invalid_public_key("invalid MLSigcrypt-v3 public key length")
     })?;
 
     signcrypt::signcrypt(
@@ -89,7 +91,7 @@ pub(crate) fn signcrypt_into(
         message,
         packet_out,
     )
-    .map_err(|_| CryptoError::encryption_failed("MLSigcrypt-v2 signcrypt failed"))
+    .map_err(|_| CryptoError::encryption_failed("MLSigcrypt-v3 signcrypt failed"))
 }
 
 pub(crate) fn unsigncrypt_into(
@@ -100,9 +102,9 @@ pub(crate) fn unsigncrypt_into(
     plaintext_out: &mut [u8],
 ) -> Result<usize> {
     let (recipient_sk, recipient_pk) = decode_secret_key(sk_user_recipient)
-        .ok_or_else(|| CryptoError::internal("invalid MLSigcrypt-v2 secret key length"))?;
+        .ok_or_else(|| CryptoError::internal("invalid MLSigcrypt-v3 secret key length"))?;
     let sender_pk = decode_public_key(pk_user_sender).ok_or_else(|| {
-        CryptoError::invalid_public_key("invalid MLSigcrypt-v2 public key length")
+        CryptoError::invalid_public_key("invalid MLSigcrypt-v3 public key length")
     })?;
 
     signcrypt::unsigncrypt(
@@ -113,7 +115,7 @@ pub(crate) fn unsigncrypt_into(
         packet,
         plaintext_out,
     )
-    .map_err(|_| CryptoError::decryption_failed("MLSigcrypt-v2 open failed"))
+    .map_err(|_| CryptoError::decryption_failed("MLSigcrypt-v3 open failed"))
 }
 
 #[cfg(test)]
@@ -134,7 +136,7 @@ mod integration_tests {
         let (sk_alice, pk_alice) = fresh_keypair(0x01);
         let (sk_bob, pk_bob) = fresh_keypair(0x02);
         let plaintext = b"Hello, Bob. This is Alice.";
-        let aad = b"session-id:v2";
+        let aad = b"session-id:v3";
         let mut packet = vec![0u8; plaintext.len() + PACKET_FIXED_OVERHEAD];
         let packet_len = signcrypt(&sk_alice, &pk_alice, &pk_bob, aad, plaintext, &mut packet)
             .expect("signcrypt must succeed");

@@ -1,6 +1,6 @@
-# ML-DSA-87 Internal Module
+# `ml` Internal Module
 
-Implements ML-DSA-87 key generation, signing, and verification internals.
+Implements the ML-DSA-87 key generation, signing, and verification internals.
 
 ## Core Pieces
 
@@ -19,7 +19,8 @@ Implements ML-DSA-87 key generation, signing, and verification internals.
 
 ## Integration
 
-`src/pqc.rs` wraps this module for crate-level API use, timing-floor enforcement, and normalized error mapping.
+`src/mlsigcrypt/` uses this module directly for key generation, signing, verification,
+and shared lattice operations in the level-3 algebraic path.
 
 ## Verification Focus
 

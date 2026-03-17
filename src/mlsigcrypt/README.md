@@ -1,22 +1,22 @@
 # MLSigcrypt Internal Layout
 
-This directory contains the internal MLSigcrypt-v2 level-2 protocol code plus
+This directory contains the internal MLSigcrypt-v3 level-3 protocol code plus
 the primitive implementations it depends on.
 
 ## Root Modules
 
-- `mod.rs` — MLSigcrypt-v2 level-2 module root, integration tests, and byte-buffer entry points
-- `keys.rs` — unified identity key types, level-2 encoding, and shared-matrix key derivation
+- `mod.rs` — MLSigcrypt-v3 level-3 module root, integration tests, and byte-buffer entry points
+- `keys.rs` — unified identity key types, level-3 encoding, and per-identity shared-matrix derivation
 - `params.rs` — protocol constants, sizes, offsets, and packet layout
 - `signcrypt.rs` — signcrypt / unsigncrypt packet processing
 - `specs/` — primitive implementations and supporting spec-level helpers
 
 ## `specs/` Modules
 
-- `sha3_512.rs` — SHA3-512 used by key derivation, key IDs, and AAD normalization
-- `sha512.rs` — SHA-512 implementation retained as an internal spec module
-- `mlkem1024/` — ML-KEM-1024 encapsulation internals
-- `mldsa87/` — ML-DSA-87 signature internals
+- `algebraic.rs` — exact algebraic encapsulation helpers used by the level-3 packet path
+- `keccak.rs` — shared Keccak sponge and SHAKE-128 helper for transcript, XOF, and keystream logic
+- `sha512.rs` — consolidated SHA3-512 and SHA-512 helpers used by key derivation and spec-level hashing
+- `ml/` — ML-DSA-87 signature internals and shared lattice arithmetic
 
 ## Visibility Rules
 
@@ -28,7 +28,8 @@ Public API entry points remain in `src/lib.rs`.
 - Fixed-size arrays are preferred for secret state and wire-format fields.
 - Sensitive intermediates are explicitly zeroized.
 - Protocol logic is kept at the `mlsigcrypt/` root; primitive logic stays under `specs/`.
-- Level-2 key generation derives a shared public matrix for ML-KEM and ML-DSA from one secret `matrix_seed`.
+- Level-3 key generation derives a per-identity `rho_shared` from one secret `matrix_seed`.
+- The level-3 packet path uses an algebraic encapsulation field and split ML-DSA response fields (`z`, `c_tilde`, `h`).
 - Tests cover known-answer vectors, tamper rejection, roundtrips, and layout invariants.
 
 ## Verification Workflow

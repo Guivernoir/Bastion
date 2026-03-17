@@ -1,6 +1,6 @@
-use crate::mlsigcrypt::specs::mldsa87::field::{fqmul, use_hint};
-use crate::mlsigcrypt::specs::mldsa87::matrix::PolyMatrix;
-use crate::mlsigcrypt::specs::mldsa87::packing::{polyw1_pack, unpack_pk, unpack_sig};
+use crate::mlsigcrypt::specs::ml::field::{fqmul, use_hint};
+use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
+use crate::mlsigcrypt::specs::ml::packing::{polyw1_pack, unpack_pk, unpack_sig};
 /// ML-DSA-87 signature verification — FIPS 204 Algorithm 3.
 ///
 /// # Algorithm
@@ -25,14 +25,12 @@ use crate::mlsigcrypt::specs::mldsa87::packing::{polyw1_pack, unpack_pk, unpack_
 /// The final comparison (step 11) uses a constant-time equality check.
 /// Steps 5–9 do NOT branch on secret data; all branches depend only on
 /// public inputs or iteration variables.
-use crate::mlsigcrypt::specs::mldsa87::params::{
+use crate::mlsigcrypt::specs::ml::params::{
     BETA, GAMMA1, K, L, LAMBDA2_BYTES, N, PK_BYTES, POLYW1_BYTES, SIG_BYTES,
 };
-use crate::mlsigcrypt::specs::mldsa87::poly::Poly;
-use crate::mlsigcrypt::specs::mldsa87::sampling::{
-    expand_a, sample_in_ball, shake256_absorb_squeeze,
-};
-use crate::mlsigcrypt::specs::mldsa87::vec::PolyVec;
+use crate::mlsigcrypt::specs::ml::poly::Poly;
+use crate::mlsigcrypt::specs::ml::sampling::{expand_a, sample_in_ball, shake256_absorb_squeeze};
+use crate::mlsigcrypt::specs::ml::vec::PolyVec;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 

@@ -1,13 +1,16 @@
 /// Keccak-f[1600] permutation and sponge construction.
 ///
-/// This is the single crypto primitive underlying every hash and XOF in ML-KEM:
-///   SHA3-256, SHA3-512, SHAKE-128, SHAKE-256.
+/// This is the single crypto primitive underlying the MLSigcrypt hash/XOF
+/// stack: SHA3-512, SHAKE-128, and SHAKE-256.
 ///
 /// Layout: `state[x + 5*y]` for x,y ∈ 0..5. 25 lanes of 64 bits = 1600 bits.
 ///
 /// Correctness reference: NIST FIPS 202 / Keccak team reference implementation.
 /// No allocations; state lives on the stack. Caller must zeroize after use.
 use core::ptr;
+
+const SHAKE128_RATE: usize = 168;
+const SHAKE_SUFFIX: u8 = 0x1F;
 
 // ── Round constants (ι step) ──────────────────────────────────────────────────
 
@@ -239,4 +242,14 @@ pub(crate) fn zeroize_sponge<const RATE: usize>(s: &mut KeccakSponge<RATE>) {
         ptr::write_volatile(&mut s.squeez, false);
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// SHAKE-128 over a single input slice, producing exactly `out.len()` bytes.
+#[inline]
+pub(crate) fn shake128(data: &[u8], out: &mut [u8]) {
+    let mut sponge: KeccakSponge<SHAKE128_RATE> = KeccakSponge::new();
+    sponge.absorb(data);
+    sponge.finalize(SHAKE_SUFFIX);
+    sponge.squeeze(out);
+    zeroize_sponge(&mut sponge);
 }

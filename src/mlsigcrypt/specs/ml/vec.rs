@@ -8,8 +8,8 @@
 /// All const-sized arrays are initialized via `core::mem::zeroed()` — safe for i32.
 ///
 /// Sensitive vectors (s1, s2, t0, y, z) must be zeroized before drop.
-use crate::mlsigcrypt::specs::mldsa87::params::K;
-use crate::mlsigcrypt::specs::mldsa87::poly::{Poly, zeroize_poly};
+use crate::mlsigcrypt::specs::ml::params::K;
+use crate::mlsigcrypt::specs::ml::poly::{Poly, zeroize_poly};
 
 // ── Type ──────────────────────────────────────────────────────────────────────
 

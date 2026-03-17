@@ -1,6 +1,6 @@
-use crate::mlsigcrypt::specs::mldsa87::field::{decompose, fqmul, make_hint, reduce32};
-use crate::mlsigcrypt::specs::mldsa87::matrix::PolyMatrix;
-use crate::mlsigcrypt::specs::mldsa87::packing::{pack_sig, polyw1_pack, unpack_sk};
+use crate::mlsigcrypt::specs::ml::field::{decompose, fqmul, make_hint, reduce32};
+use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
+use crate::mlsigcrypt::specs::ml::packing::{pack_sig, polyw1_pack, unpack_sk};
 /// ML-DSA-87 signing — FIPS 204 Algorithm 2.
 ///
 /// # Algorithm
@@ -36,14 +36,14 @@ use crate::mlsigcrypt::specs::mldsa87::packing::{pack_sig, polyw1_pack, unpack_s
 /// This is by design: iteration count reveals no information beyond a geometric
 /// distribution with a fixed parameter. Side-channel analysis of WHICH iteration
 /// succeeded may still be possible on some microarchitectures.
-use crate::mlsigcrypt::specs::mldsa87::params::{
+use crate::mlsigcrypt::specs::ml::params::{
     BETA, GAMMA1, GAMMA2, K, L, LAMBDA2_BYTES, N, OMEGA, POLYW1_BYTES, SIG_BYTES, SK_BYTES,
 };
-use crate::mlsigcrypt::specs::mldsa87::poly::Poly;
-use crate::mlsigcrypt::specs::mldsa87::sampling::{
+use crate::mlsigcrypt::specs::ml::poly::Poly;
+use crate::mlsigcrypt::specs::ml::sampling::{
     expand_a, expand_mask, sample_in_ball, shake256_absorb_squeeze,
 };
-use crate::mlsigcrypt::specs::mldsa87::vec::{PolyVec, zeroize_polyvec};
+use crate::mlsigcrypt::specs::ml::vec::{PolyVec, zeroize_polyvec};
 use crate::zeroize::zeroize_array;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -255,5 +255,5 @@ pub(crate) fn sign(sig: &mut [u8; SIG_BYTES], msg: &[u8], sk: &[u8; SK_BYTES], r
     zeroize_array(&mut rho_prime);
     zeroize_array(&mut c_tilde);
     zeroize_array(&mut w1_packed_buf);
-    crate::mlsigcrypt::specs::mldsa87::poly::zeroize_poly(&mut c_hat);
+    crate::mlsigcrypt::specs::ml::poly::zeroize_poly(&mut c_hat);
 }

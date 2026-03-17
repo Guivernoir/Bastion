@@ -1,16 +1,32 @@
-// SHA-512 implementation
-// no_alloc, no external deps, volatile zeroization, unsafe-aware
-// All symbols pub(crate) or private.
-
+/// Consolidated internal 512-bit hash helpers.
+///
+/// This module carries both:
+/// - SHA3-512 over one or more input slices for the live MLSigcrypt path
+/// - SHA-512 as a retained spec-level implementation
+use super::keccak::{KeccakSponge, zeroize_sponge};
 use crate::zeroize::zeroize_mem;
 use core::ptr;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
+const SHA3_SUFFIX: u8 = 0x06;
+const SHA3_512_RATE: usize = 72;
 const BLOCK_LEN: usize = 128;
 const DIGEST_LEN: usize = 64;
 
-/// Initial hash values (first 64 bits of fractional parts of sqrt of primes 2..19)
+/// SHA3-512 digest length in bytes.
+pub(crate) const SHA3_512_OUTPUT_LEN: usize = 64;
+
+/// SHA3-512 over the concatenation of `inputs`.
+pub(crate) fn sha3_512_hash(inputs: &[&[u8]], out: &mut [u8; SHA3_512_OUTPUT_LEN]) {
+    let mut sponge: KeccakSponge<SHA3_512_RATE> = KeccakSponge::new();
+    for input in inputs {
+        sponge.absorb(input);
+    }
+    sponge.finalize(SHA3_SUFFIX);
+    sponge.squeeze(out);
+    zeroize_sponge(&mut sponge);
+}
+
+/// Initial hash values (first 64 bits of fractional parts of sqrt of primes 2..19).
 const IV: [u64; 8] = [
     0x6a09e667f3bcc908,
     0xbb67ae8584caa73b,
@@ -22,7 +38,7 @@ const IV: [u64; 8] = [
     0x5be0cd19137e2179,
 ];
 
-/// Round constants (first 64 bits of fractional parts of cbrt of primes 2..409)
+/// Round constants (first 64 bits of fractional parts of cbrt of primes 2..409).
 const K: [u64; 80] = [
     0x428a2f98d728ae22,
     0x7137449123ef65cd,
@@ -106,8 +122,6 @@ const K: [u64; 80] = [
     0x6c44198c4a475817,
 ];
 
-// ── SHA-512 logical functions ────────────────────────────────────────────────
-
 #[inline(always)]
 const fn ch(x: u64, y: u64, z: u64) -> u64 {
     (x & y) ^ (!x & z)
@@ -118,44 +132,34 @@ const fn maj(x: u64, y: u64, z: u64) -> u64 {
     (x & y) ^ (x & z) ^ (y & z)
 }
 
-/// Big-sigma 0: Σ₀(a)
 #[inline(always)]
 const fn bsig0(x: u64) -> u64 {
     x.rotate_right(28) ^ x.rotate_right(34) ^ x.rotate_right(39)
 }
 
-/// Big-sigma 1: Σ₁(e)
 #[inline(always)]
 const fn bsig1(x: u64) -> u64 {
     x.rotate_right(14) ^ x.rotate_right(18) ^ x.rotate_right(41)
 }
 
-/// Small-sigma 0: σ₀ — message schedule
 #[inline(always)]
 const fn ssig0(x: u64) -> u64 {
     x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7)
 }
 
-/// Small-sigma 1: σ₁ — message schedule
 #[inline(always)]
 const fn ssig1(x: u64) -> u64 {
     x.rotate_right(19) ^ x.rotate_right(61) ^ (x >> 6)
 }
 
-// ── Core compression ────────────────────────────────────────────────────────
-
-/// Compress a single 1024-bit block into `state`.
-/// Message schedule lives on the stack; it is zeroized before returning.
 fn compress(state: &mut [u64; 8], block: &[u8; BLOCK_LEN]) {
     let mut w = [0u64; 80];
 
-    // Load first 16 words — avoid try_into + unwrap via raw pointer read.
     for i in 0..16 {
-        // SAFETY: block is exactly BLOCK_LEN bytes; i*8 is always in bounds.
+        // SAFETY: `block` is exactly one full SHA-512 block.
         w[i] = u64::from_be_bytes(unsafe { *(block.as_ptr().add(i * 8) as *const [u8; 8]) });
     }
 
-    // Expand schedule
     for i in 16..80 {
         w[i] = ssig1(w[i - 2])
             .wrapping_add(w[i - 7])
@@ -165,7 +169,6 @@ fn compress(state: &mut [u64; 8], block: &[u8; BLOCK_LEN]) {
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
 
-    // 80 rounds — unrolled by the compiler at opt-level >= 2
     for i in 0..80 {
         let t1 = h
             .wrapping_add(bsig1(e))
@@ -193,12 +196,9 @@ fn compress(state: &mut [u64; 8], block: &[u8; BLOCK_LEN]) {
     state[6] = state[6].wrapping_add(g);
     state[7] = state[7].wrapping_add(h);
 
-    // Burn message schedule — sensitive key-material may be in the input.
-    // SAFETY: `w` is a valid writable stack allocation.
+    // SAFETY: `w` is a valid writable stack buffer.
     unsafe { zeroize_mem(w.as_mut_ptr() as *mut u8, core::mem::size_of_val(&w)) };
 }
-
-// ── Hasher ───────────────────────────────────────────────────────────────────
 
 /// Streaming SHA-512 hasher.
 ///
@@ -207,7 +207,7 @@ pub(crate) struct Sha512 {
     state: [u64; 8],
     block: [u8; BLOCK_LEN],
     block_len: usize,
-    total_len: u128, // bytes — u128 handles > 2^64 bits per spec
+    total_len: u128,
 }
 
 impl Sha512 {
@@ -225,7 +225,6 @@ impl Sha512 {
     pub(crate) fn update(&mut self, mut data: &[u8]) {
         self.total_len = self.total_len.wrapping_add(data.len() as u128);
 
-        // Fill any partial block first.
         if self.block_len > 0 {
             let space = BLOCK_LEN - self.block_len;
             let take = data.len().min(space);
@@ -234,7 +233,7 @@ impl Sha512 {
             data = &data[take..];
 
             if self.block_len == BLOCK_LEN {
-                // SAFETY: block_len == BLOCK_LEN means the array is full.
+                // SAFETY: `block_len == BLOCK_LEN` means the block is full.
                 compress(&mut self.state, unsafe {
                     &*(self.block.as_ptr() as *const [u8; BLOCK_LEN])
                 });
@@ -244,16 +243,14 @@ impl Sha512 {
             }
         }
 
-        // Process full blocks directly from the input slice — zero copies.
         while data.len() >= BLOCK_LEN {
-            // SAFETY: data.len() >= BLOCK_LEN guarantees the cast is valid.
+            // SAFETY: `data.len() >= BLOCK_LEN` guarantees the cast is valid.
             compress(&mut self.state, unsafe {
                 &*(data.as_ptr() as *const [u8; BLOCK_LEN])
             });
             data = &data[BLOCK_LEN..];
         }
 
-        // Buffer the remainder.
         if !data.is_empty() {
             self.block[..data.len()].copy_from_slice(data);
             self.block_len = data.len();
@@ -261,20 +258,15 @@ impl Sha512 {
     }
 
     /// Consume the hasher and return the 64-byte digest.
-    ///
-    /// The internal state is zeroized via [`Drop`] after `self` is consumed.
     pub(crate) fn finalize(mut self) -> [u8; DIGEST_LEN] {
         let bit_len = self.total_len.wrapping_mul(8);
 
-        // Append the mandatory 0x80 padding byte.
         self.block[self.block_len] = 0x80;
         self.block_len += 1;
 
-        // If there is not enough room for the 16-byte length field,
-        // pad with zeros, compress, and start a fresh block.
         if self.block_len > BLOCK_LEN - 16 {
             self.block[self.block_len..].fill(0);
-            // SAFETY: block is fully initialized.
+            // SAFETY: `self.block` is fully initialized here.
             compress(&mut self.state, unsafe {
                 &*(self.block.as_ptr() as *const [u8; BLOCK_LEN])
             });
@@ -283,23 +275,17 @@ impl Sha512 {
             self.block_len = 0;
         }
 
-        // Zero-pad up to the length field position.
         self.block[self.block_len..BLOCK_LEN - 16].fill(0);
+        self.block[BLOCK_LEN - 16..].copy_from_slice(&bit_len.to_be_bytes());
 
-        // Append message bit-length as big-endian u128 (two u64s per spec).
-        // SHA-512 uses a 128-bit length field.
-        let len_bytes = bit_len.to_be_bytes();
-        self.block[BLOCK_LEN - 16..].copy_from_slice(&len_bytes);
-
-        // SAFETY: block is fully initialized.
+        // SAFETY: `self.block` is fully initialized here.
         compress(&mut self.state, unsafe {
             &*(self.block.as_ptr() as *const [u8; BLOCK_LEN])
         });
 
-        // Serialise state to digest.
         let mut digest = [0u8; DIGEST_LEN];
         for (i, &word) in self.state.iter().enumerate() {
-            // SAFETY: i < 8, each write is 8 bytes, total 64 bytes — in bounds.
+            // SAFETY: `digest` has room for exactly eight 8-byte words.
             unsafe {
                 ptr::write_unaligned(
                     digest.as_mut_ptr().add(i * 8) as *mut [u8; 8],
@@ -308,14 +294,13 @@ impl Sha512 {
             }
         }
 
-        // `self` drops here → Drop::drop zeroizes state, block, lengths.
         digest
     }
 }
 
-/// One-shot convenience wrapper.
+/// One-shot SHA-512 convenience wrapper.
 #[inline]
-pub(crate) fn hash(data: &[u8]) -> [u8; DIGEST_LEN] {
+pub(crate) fn sha512_hash(data: &[u8]) -> [u8; DIGEST_LEN] {
     let mut h = Sha512::new();
     h.update(data);
     h.finalize()
@@ -331,15 +316,12 @@ impl Drop for Sha512 {
             );
             zeroize_mem(self.block.as_mut_ptr(), self.block.len());
         }
-        // Volatile-write scalars individually — compiler cannot batch-elide them.
         unsafe {
             ptr::write_volatile(&mut self.block_len, 0usize);
             ptr::write_volatile(&mut self.total_len, 0u128);
         }
     }
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -364,11 +346,40 @@ mod tests {
         out
     }
 
-    // NIST FIPS 180-4 test vectors
+    #[test]
+    fn sha3_512_empty() {
+        let mut out = [0u8; SHA3_512_OUTPUT_LEN];
+        sha3_512_hash(&[b""], &mut out);
+        assert_eq!(
+            &out[..8],
+            &[0xa6u8, 0x9f, 0x73, 0xcc, 0xa2, 0x3a, 0x9a, 0xc5],
+            "SHA3-512 empty string first 8 bytes mismatch"
+        );
+    }
+
+    #[test]
+    fn sha3_512_multi_input_equals_concat() {
+        let a = b"hello";
+        let b = b" world";
+        let mut out_multi = [0u8; SHA3_512_OUTPUT_LEN];
+        let mut out_single = [0u8; SHA3_512_OUTPUT_LEN];
+        sha3_512_hash(&[a, b], &mut out_multi);
+        sha3_512_hash(&[b"hello world"], &mut out_single);
+        assert_eq!(out_multi, out_single);
+    }
+
+    #[test]
+    fn sha3_512_deterministic() {
+        let mut first = [0u8; SHA3_512_OUTPUT_LEN];
+        let mut second = [0u8; SHA3_512_OUTPUT_LEN];
+        sha3_512_hash(&[b"test"], &mut first);
+        sha3_512_hash(&[b"test"], &mut second);
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn empty_string() {
-        let digest = hash(b"");
+        let digest = sha512_hash(b"");
         assert_eq!(
             digest,
             decode_hex_64(
@@ -380,7 +391,7 @@ mod tests {
 
     #[test]
     fn abc() {
-        let digest = hash(b"abc");
+        let digest = sha512_hash(b"abc");
         assert_eq!(
             digest,
             decode_hex_64(
@@ -392,8 +403,7 @@ mod tests {
 
     #[test]
     fn long_message() {
-        // "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-        let digest = hash(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        let digest = sha512_hash(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
         assert_eq!(
             digest,
             decode_hex_64(
@@ -405,7 +415,6 @@ mod tests {
 
     #[test]
     fn one_million_a() {
-        // "a" repeated 1_000_000 times
         let mut h = Sha512::new();
         let chunk = [b'a'; 1000];
         for _ in 0..1000 {
@@ -424,7 +433,7 @@ mod tests {
     #[test]
     fn streaming_equals_oneshot() {
         let data = b"The quick brown fox jumps over the lazy dog";
-        let oneshot = hash(data);
+        let oneshot = sha512_hash(data);
 
         let mut h = Sha512::new();
         for chunk in data.chunks(7) {
@@ -437,10 +446,8 @@ mod tests {
 
     #[test]
     fn cross_block_boundary() {
-        // Feed data that straddles a 128-byte block boundary to exercise the
-        // partial-block buffering path.
-        let data = [0x61u8; 200]; // 200 × 'a'
-        let oneshot = hash(&data);
+        let data = [0x61u8; 200];
+        let oneshot = sha512_hash(&data);
 
         let mut h = Sha512::new();
         h.update(&data[..100]);
@@ -450,9 +457,8 @@ mod tests {
 
     #[test]
     fn exact_block_size() {
-        // Exactly one block — exercises the path where padding goes to a new block.
         let data = [0xffu8; BLOCK_LEN];
-        let d1 = hash(&data);
+        let d1 = sha512_hash(&data);
         let mut h = Sha512::new();
         h.update(&data);
         assert_eq!(d1, h.finalize());
