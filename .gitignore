@@ -1,6 +1,7 @@
 /target/
 /results.txt
 /criterion/
+1.0.0.md
 
 # Fuzzing artifacts
 /fuzz/target/

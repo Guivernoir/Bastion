@@ -3,8 +3,10 @@
 //! Public APIs:
 //! - [`encrypt`]: AES-256-GCM encrypt
 //! - [`decrypt`]: AES-256-GCM decrypt
+//! - [`kem_keygen`]: ML-KEM-1024 key generation
 //! - [`encapsulate`]: ML-KEM-1024 encapsulate
 //! - [`decapsulate`]: ML-KEM-1024 decapsulate
+//! - [`dsa_keygen`]: ML-DSA-87 key generation
 //! - [`sign`]: ML-DSA-87 detached signature
 //! - [`verify`]: ML-DSA-87 signature verification
 //! - [`hash`]: SHA-512 digest
@@ -36,32 +38,43 @@ use crate::constant_time::{
     ct_copy_if, ct_eq, ct_hamming_weight, ct_in_range, ct_mod_reduce, ct_xor,
 };
 use crate::os_random::fill_os_random_array;
-use crate::zeroize::zeroize_array;
+use crate::zeroize::{zeroize_array, zeroize_slice};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// ML-KEM-1024 public key size (bytes).
-pub(crate) const KEM_PK_SIZE: usize = pqc::KEM_PK_SIZE;
+pub const KEM_PUBLIC_KEY_SIZE: usize = pqc::KEM_PK_SIZE;
 /// ML-KEM-1024 secret key size (bytes).
-pub(crate) const KEM_SK_SIZE: usize = pqc::KEM_SK_SIZE;
+pub const KEM_SECRET_KEY_SIZE: usize = pqc::KEM_SK_SIZE;
 /// ML-KEM-1024 ciphertext size (bytes).
-pub(crate) const KEM_CT_SIZE: usize = pqc::KEM_CT_SIZE;
+pub const KEM_CIPHERTEXT_SIZE: usize = pqc::KEM_CT_SIZE;
 /// ML-DSA-87 public key size (bytes).
-pub(crate) const DSA_PK_SIZE: usize = pqc::DSA_PK_SIZE;
+pub const DSA_PUBLIC_KEY_SIZE: usize = pqc::DSA_PK_SIZE;
+/// ML-DSA-87 secret key size (bytes).
+pub const DSA_SECRET_KEY_SIZE: usize = pqc::DSA_SK_SIZE;
 /// ML-DSA-87 detached signature size (bytes).
-pub(crate) const DSA_SIG_SIZE: usize = pqc::DSA_SIG_SIZE;
-
-const NONCE_SIZE: usize = 12;
-const TAG_SIZE: usize = 16;
+pub const DSA_SIGNATURE_SIZE: usize = pqc::DSA_SIG_SIZE;
+/// AES-GCM nonce size (bytes).
+pub const NONCE_SIZE: usize = 12;
+/// AES-GCM authentication tag size (bytes).
+pub const TAG_SIZE: usize = 16;
 
 /// Per-layer fixed overhead in bytes.
-pub(crate) const LAYER_OVERHEAD: usize = KEM_CT_SIZE + NONCE_SIZE + TAG_SIZE + DSA_SIG_SIZE;
+pub const LAYER_OVERHEAD: usize = KEM_CIPHERTEXT_SIZE + NONCE_SIZE + TAG_SIZE + DSA_SIGNATURE_SIZE;
+
+const KEM_PK_SIZE: usize = KEM_PUBLIC_KEY_SIZE;
+const KEM_SK_SIZE: usize = KEM_SECRET_KEY_SIZE;
+const KEM_CT_SIZE: usize = KEM_CIPHERTEXT_SIZE;
+const DSA_PK_SIZE: usize = DSA_PUBLIC_KEY_SIZE;
+const DSA_SIG_SIZE: usize = DSA_SIGNATURE_SIZE;
 
 /// Best-effort timing floors for the public API wrappers (ns).
 const FLOOR_PUBLIC_ENCRYPT_NS: u64 = 50_000;
 const FLOOR_PUBLIC_DECRYPT_NS: u64 = 700_000;
+const FLOOR_PUBLIC_KEM_KEYGEN_NS: u64 = 120_000;
 const FLOOR_PUBLIC_ENCAPSULATE_NS: u64 = 120_000;
 const FLOOR_PUBLIC_DECAPSULATE_NS: u64 = 1_200_000;
+const FLOOR_PUBLIC_DSA_KEYGEN_NS: u64 = 300_000;
 const FLOOR_PUBLIC_SIGN_NS: u64 = 300_000;
 const FLOOR_PUBLIC_VERIFY_NS: u64 = 2_700_000;
 const FLOOR_PUBLIC_HASH_NS: u64 = 40_000;
@@ -168,11 +181,7 @@ fn wrap_layer_in_place(
 
         let mut nonce_arr = [0u8; NONCE_SIZE];
         fill_layer_nonce(&mut nonce_arr)?;
-        ct_copy_if(
-            true,
-            &nonce_arr,
-            &mut buf[nonce_start..nonce_start + NONCE_SIZE],
-        );
+        buf[nonce_start..nonce_start + NONCE_SIZE].copy_from_slice(&nonce_arr);
 
         let cipher = Aes256Gcm::new(Key256::from_mut_bytes(&mut aes_key));
         let tag = cipher
@@ -252,7 +261,8 @@ fn peel_layer_in_place(packet: &mut [u8], kem_sk: &[u8], dsa_pk: &[u8]) -> Resul
 
     pqc::dsa_verify(dsa_pk, signed, sig)?;
 
-    let mut aes_key = pqc::kem_decapsulate(kem_ct, kem_sk)?;
+    let mut aes_key = [0u8; 32];
+    pqc::kem_decapsulate_into(kem_ct, kem_sk, &mut aes_key)?;
     validate_key_entropy(&aes_key)?;
 
     packet.copy_within(ct_start..ct_end, 0);
@@ -261,6 +271,9 @@ fn peel_layer_in_place(packet: &mut [u8], kem_sk: &[u8], dsa_pk: &[u8]) -> Resul
         .open_in_place(&Nonce(nonce_arr), b"", &mut packet[..ct_len], &tag_arr)
         .map_err(|_| CryptoError::decryption_failed("AES-GCM auth tag mismatch"));
 
+    if decrypt_res.is_err() {
+        zeroize_slice(&mut packet[..ct_len]);
+    }
     zeroize_array(&mut aes_key);
     decrypt_res?;
     Ok(ct_len)
@@ -302,7 +315,7 @@ pub fn encrypt(
     let start = Instant::now();
 
     let mut key_buf = [0u8; 32];
-    ct_copy_if(true, key, &mut key_buf);
+    key_buf.copy_from_slice(key);
 
     let out_ok = ciphertext_out.len() >= plaintext.len();
     let result = if out_ok {
@@ -310,13 +323,19 @@ pub fn encrypt(
         out.copy_from_slice(plaintext);
 
         let gcm = Aes256Gcm::new(Key256::from_mut_bytes(&mut key_buf));
-        gcm.seal_in_place(&Nonce(*nonce), aad, out)
-            .map(|tag| {
+        match gcm.seal_in_place(&Nonce(*nonce), aad, out) {
+            Ok(tag) => {
                 tag_out.copy_from_slice(&tag);
-                plaintext.len()
-            })
-            .map_err(|_| "encryption failed")
+                Ok(plaintext.len())
+            }
+            Err(_) => {
+                zeroize_slice(out);
+                tag_out.fill(0);
+                Err("encryption failed")
+            }
+        }
     } else {
+        zeroize_slice(ciphertext_out);
         tag_out.fill(0);
         Err("ciphertext output buffer too small")
     };
@@ -338,7 +357,7 @@ pub fn decrypt(
     let start = Instant::now();
 
     let mut key_buf = [0u8; 32];
-    ct_copy_if(true, key, &mut key_buf);
+    key_buf.copy_from_slice(key);
 
     let out_ok = plaintext_out.len() >= ciphertext.len();
     let result = if out_ok {
@@ -346,10 +365,15 @@ pub fn decrypt(
         out.copy_from_slice(ciphertext);
 
         let gcm = Aes256Gcm::new(Key256::from_mut_bytes(&mut key_buf));
-        gcm.open_in_place(&Nonce(*nonce), aad, out, tag)
-            .map(|_| ciphertext.len())
-            .map_err(|_| "decryption failed")
+        match gcm.open_in_place(&Nonce(*nonce), aad, out, tag) {
+            Ok(_) => Ok(ciphertext.len()),
+            Err(_) => {
+                zeroize_slice(out);
+                Err("decryption failed")
+            }
+        }
     } else {
+        zeroize_slice(plaintext_out);
         Err("plaintext output buffer too small")
     };
 
@@ -358,10 +382,30 @@ pub fn decrypt(
     result
 }
 
+/// ML-KEM-1024 key generation.
+pub fn kem_keygen(
+    pk_out: &mut [u8; KEM_PUBLIC_KEY_SIZE],
+    sk_out: &mut [u8; KEM_SECRET_KEY_SIZE],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
+
+    let result = match pqc::kem_keygen_into(pk_out, sk_out) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            zeroize_array(pk_out);
+            zeroize_array(sk_out);
+            Err("kem key generation failed")
+        }
+    };
+
+    enforce_public_floor(start, FLOOR_PUBLIC_KEM_KEYGEN_NS);
+    result
+}
+
 /// ML-KEM-1024 encapsulation.
 pub fn encapsulate(
     pk: &[u8],
-    ct_out: &mut [u8; 1568],
+    ct_out: &mut [u8; KEM_CIPHERTEXT_SIZE],
     ss_out: &mut [u8; 32],
 ) -> std::result::Result<(), &'static str> {
     let start = Instant::now();
@@ -370,7 +414,11 @@ pub fn encapsulate(
     let mut pk_buf = [0u8; KEM_PK_SIZE];
     ct_copy_if(len_ok, pk, &mut pk_buf);
 
-    let op = pqc::kem_encapsulate_into(&pk_buf, ct_out, ss_out).map_err(|_| "encapsulation failed");
+    let op = pqc::kem_encapsulate_into(&pk_buf, ct_out, ss_out).map_err(|_| {
+        ct_out.fill(0);
+        zeroize_array(ss_out);
+        "encapsulation failed"
+    });
     let result = if len_ok {
         op
     } else {
@@ -401,14 +449,9 @@ pub fn decapsulate(
     ct_copy_if(sk_ok, sk, &mut sk_buf);
     ct_copy_if(ct_ok, ct, &mut ct_buf);
 
-    let decap_res = pqc::kem_decapsulate(&ct_buf, &sk_buf);
     let result = if len_ok {
-        match decap_res {
-            Ok(mut ss) => {
-                ss_out.copy_from_slice(&ss);
-                zeroize_array(&mut ss);
-                Ok(())
-            }
+        match pqc::kem_decapsulate_into(&ct_buf, &sk_buf, ss_out) {
+            Ok(()) => Ok(()),
             Err(_) => {
                 zeroize_array(ss_out);
                 Err("decapsulation failed")
@@ -425,11 +468,31 @@ pub fn decapsulate(
     result
 }
 
+/// ML-DSA-87 key generation.
+pub fn dsa_keygen(
+    pk_out: &mut [u8; DSA_PUBLIC_KEY_SIZE],
+    sk_out: &mut [u8; DSA_SECRET_KEY_SIZE],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
+
+    let result = match pqc::dsa_keygen_into(pk_out, sk_out) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            zeroize_array(pk_out);
+            zeroize_array(sk_out);
+            Err("dsa key generation failed")
+        }
+    };
+
+    enforce_public_floor(start, FLOOR_PUBLIC_DSA_KEYGEN_NS);
+    result
+}
+
 /// ML-DSA-87 detached signature.
 pub fn sign(
     sk: &[u8],
     msg: &[u8],
-    sig_out: &mut [u8; 4627],
+    sig_out: &mut [u8; DSA_SIGNATURE_SIZE],
 ) -> std::result::Result<(), &'static str> {
     let start = Instant::now();
 
@@ -437,7 +500,10 @@ pub fn sign(
     let mut sk_buf = [0u8; pqc::DSA_SK_SIZE];
     ct_copy_if(len_ok, sk, &mut sk_buf);
 
-    let op = pqc::dsa_sign_into(&sk_buf, msg, sig_out).map_err(|_| "sign failed");
+    let op = pqc::dsa_sign_into(&sk_buf, msg, sig_out).map_err(|_| {
+        zeroize_array(sig_out);
+        "sign failed"
+    });
     let result = if len_ok {
         op
     } else {
@@ -495,8 +561,10 @@ pub fn layer_encrypt(
     out: &mut [u8],
 ) -> std::result::Result<usize, &'static str> {
     let start = Instant::now();
-    let result = onion_internal_into(plaintext, &kem_pks, &dsa_sks, out)
-        .map_err(|_| "layer encryption failed");
+    let result = onion_internal_into(plaintext, &kem_pks, &dsa_sks, out).map_err(|_| {
+        zeroize_slice(out);
+        "layer encryption failed"
+    });
     enforce_public_floor(start, FLOOR_PUBLIC_LAYER_NS);
     result
 }
@@ -509,8 +577,10 @@ pub fn layer_decrypt(
     out: &mut [u8],
 ) -> std::result::Result<usize, &'static str> {
     let start = Instant::now();
-    let result =
-        cut_internal_into(packet, &kem_sks, &dsa_pks, out).map_err(|_| "layer decrypt failed");
+    let result = cut_internal_into(packet, &kem_sks, &dsa_pks, out).map_err(|_| {
+        zeroize_slice(out);
+        "layer decrypt failed"
+    });
     enforce_public_floor(start, FLOOR_PUBLIC_LAYER_DECRYPT_NS);
     result
 }
@@ -523,8 +593,10 @@ pub fn onion(
     out: &mut [u8],
 ) -> std::result::Result<usize, &'static str> {
     let start = Instant::now();
-    let result = onion_internal_into(plaintext, kem_pks, dsa_sks, out)
-        .map_err(|_| "onion encryption failed");
+    let result = onion_internal_into(plaintext, kem_pks, dsa_sks, out).map_err(|_| {
+        zeroize_slice(out);
+        "onion encryption failed"
+    });
     enforce_public_floor(start, FLOOR_PUBLIC_ONION_NS);
     result
 }
@@ -537,7 +609,39 @@ pub fn cut(
     out: &mut [u8],
 ) -> std::result::Result<usize, &'static str> {
     let start = Instant::now();
-    let result = cut_internal_into(packet, kem_sks, dsa_pks, out).map_err(|_| "cut failed");
+    let result = cut_internal_into(packet, kem_sks, dsa_pks, out).map_err(|_| {
+        zeroize_slice(out);
+        "cut failed"
+    });
     enforce_public_floor(start, FLOOR_PUBLIC_CUT_NS);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kem_public_keygen_smoke() {
+        let mut pk = [0u8; KEM_PUBLIC_KEY_SIZE];
+        let mut sk = [0u8; KEM_SECRET_KEY_SIZE];
+
+        assert!(kem_keygen(&mut pk, &mut sk).is_ok());
+
+        assert!(pk.iter().any(|&b| b != 0));
+        assert!(sk.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn dsa_public_api_roundtrip() {
+        let msg = b"bastion-dsa-roundtrip";
+        let mut pk = [0u8; DSA_PUBLIC_KEY_SIZE];
+        let mut sk = [0u8; DSA_SECRET_KEY_SIZE];
+        let mut sig = [0u8; DSA_SIGNATURE_SIZE];
+
+        assert!(dsa_keygen(&mut pk, &mut sk).is_ok());
+        assert!(sign(&sk, msg, &mut sig).is_ok());
+
+        assert!(verify(&pk, msg, &sig));
+    }
 }

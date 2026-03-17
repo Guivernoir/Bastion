@@ -16,6 +16,7 @@ use crate::constant_time::{TimingGuard, ct_zeroize_verify};
 use crate::error::{CryptoError, Result};
 use crate::os_random::fill_os_random_array;
 use crate::zeroize::zeroize_array;
+use std::time::Instant;
 
 // ── Size constants (re-exported for packet layout arithmetic) ─────────────────
 
@@ -28,8 +29,10 @@ pub(crate) const DSA_SIG_SIZE: usize = mldsa87::SIG_BYTES; // 4627
 pub(crate) const AES_KEY_SIZE: usize = 32;
 
 /// Conservative timing floors (ns) for PQC operations.
-const FLOOR_ENCAP_NS: u64 = 700_000;
-const FLOOR_DECAP_NS: u64 = 60_000;
+const FLOOR_KEM_KEYGEN_NS: u64 = 2_000_000;
+const FLOOR_ENCAP_NS: u64 = 1_500_000;
+const FLOOR_DECAP_NS: u64 = 700_000;
+const FLOOR_DSA_KEYGEN_NS: u64 = 15_000_000;
 const FLOOR_SIGN_NS: u64 = 12_000_000;
 const FLOOR_VERIFY_NS: u64 = 2_000_000;
 
@@ -41,22 +44,63 @@ fn fill_entropy<const N: usize>(buf: &mut [u8; N]) -> Result<()> {
     })
 }
 
+#[inline]
+fn enforce_floor_only(start: Instant, floor_ns: u64) {
+    loop {
+        let elapsed = core::hint::black_box(start.elapsed().as_nanos() as u64);
+        if elapsed >= floor_ns {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 // ── Key derivation ────────────────────────────────────────────────────────────
 
 /// Derive a 32-byte AES key from a KEM shared secret via SHA3-512
 /// with domain separation.
 #[inline]
-pub(crate) fn derive_aes_key(raw_ss: &[u8]) -> [u8; AES_KEY_SIZE] {
+pub(crate) fn derive_aes_key_into(raw_ss: &[u8], key_out: &mut [u8; AES_KEY_SIZE]) {
     let mut digest = [0u8; 64];
     sha3_512_x2(b"bastion-aes-key-v1\x00", raw_ss, &mut digest);
-
-    let mut key = [0u8; AES_KEY_SIZE];
-    key.copy_from_slice(&digest[..AES_KEY_SIZE]);
+    key_out.copy_from_slice(&digest[..AES_KEY_SIZE]);
     zeroize_array(&mut digest);
-    key
 }
 
 // ── ML-KEM-1024 ───────────────────────────────────────────────────────────────
+
+/// Generate an ML-KEM-1024 key pair with OS-backed entropy.
+pub(crate) fn kem_keygen_into(
+    pk_out: &mut [u8; KEM_PK_SIZE],
+    sk_out: &mut [u8; KEM_SK_SIZE],
+) -> Result<()> {
+    let mut seed = [0u8; mlkem1024::KEYGEN_SEED_BYTES];
+    fill_entropy(&mut seed)?;
+
+    let mut ek = mlkem1024::EncapKey([0u8; mlkem1024::EK_BYTES]);
+    let mut dk = mlkem1024::DecapKey([0u8; mlkem1024::DK_BYTES]);
+
+    let start = Instant::now();
+    mlkem1024::keygen(&seed, &mut ek, &mut dk);
+    enforce_floor_only(start, FLOOR_KEM_KEYGEN_NS);
+    let seed_res = ct_zeroize_verify(&mut seed).inspect_err(|e| METRICS.record_error_ctx(e));
+    if let Err(e) = seed_res {
+        zeroize_array(pk_out);
+        zeroize_array(sk_out);
+        zeroize_array(&mut ek.0);
+        let _ = ct_zeroize_verify(&mut dk.0).inspect_err(|err| METRICS.record_error_ctx(err));
+        return Err(e);
+    }
+
+    pk_out.copy_from_slice(ek.as_bytes());
+    sk_out.copy_from_slice(dk.as_bytes());
+
+    zeroize_array(&mut ek.0);
+    ct_zeroize_verify(&mut dk.0).inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    METRICS.record_ok();
+    Ok(())
+}
 
 /// Encapsulate to `pk`, returning `(kem_ct_bytes, aes_key)`.
 ///
@@ -86,16 +130,17 @@ pub(crate) fn kem_encapsulate_into(
     let mut ct = mlkem1024::Ciphertext([0u8; mlkem1024::CT_BYTES]);
     let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
     mlkem1024::encaps(&ek, &entropy, &mut ct, &mut ss);
-    guard.enforce()?;
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     let mut raw_ss = *ss.as_bytes();
-    let key = derive_aes_key(&raw_ss);
-    aes_key_out.copy_from_slice(&key);
-    zeroize_array(&mut raw_ss);
+    derive_aes_key_into(&raw_ss, aes_key_out);
     ct_zeroize_verify(&mut raw_ss).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     ct_out.copy_from_slice(ct.as_bytes());
-    zeroize_array(&mut entropy);
+    zeroize_array(&mut ct.0);
+    ct_zeroize_verify(&mut entropy).inspect_err(|e| METRICS.record_error_ctx(e))?;
     METRICS.record_ok();
     Ok(())
 }
@@ -104,7 +149,11 @@ pub(crate) fn kem_encapsulate_into(
 ///
 /// The raw shared secret is zeroized internally. The caller must zeroize
 /// `aes_key` after use.
-pub(crate) fn kem_decapsulate(kem_ct: &[u8], sk: &[u8]) -> Result<[u8; AES_KEY_SIZE]> {
+pub(crate) fn kem_decapsulate_into(
+    kem_ct: &[u8],
+    sk: &[u8],
+    aes_key_out: &mut [u8; AES_KEY_SIZE],
+) -> Result<()> {
     if kem_ct.len() != KEM_CT_SIZE {
         return Err(CryptoError::invalid_packet("invalid KEM ciphertext length"));
     }
@@ -120,18 +169,54 @@ pub(crate) fn kem_decapsulate(kem_ct: &[u8], sk: &[u8]) -> Result<[u8; AES_KEY_S
     let guard = TimingGuard::new("ml_kem_decap", FLOOR_DECAP_NS);
     let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
     mlkem1024::decaps(&dk_t, &ct_t, &mut ss);
-    guard.enforce()?;
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     let mut raw_ss = *ss.as_bytes();
-    let aes_key = derive_aes_key(&raw_ss);
-    zeroize_array(&mut raw_ss);
+    derive_aes_key_into(&raw_ss, aes_key_out);
     ct_zeroize_verify(&mut raw_ss).inspect_err(|e| METRICS.record_error_ctx(e))?;
+    zeroize_array(&mut ct_t.0);
+    ct_zeroize_verify(&mut dk_t.0).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     METRICS.record_ok();
-    Ok(aes_key)
+    Ok(())
 }
 
 // ── ML-DSA-87 ─────────────────────────────────────────────────────────────────
+
+/// Generate an ML-DSA-87 key pair with OS-backed entropy.
+pub(crate) fn dsa_keygen_into(
+    pk_out: &mut [u8; DSA_PK_SIZE],
+    sk_out: &mut [u8; DSA_SK_SIZE],
+) -> Result<()> {
+    let mut seed = [0u8; 32];
+    fill_entropy(&mut seed)?;
+
+    let mut pk = [0u8; mldsa87::PK_BYTES];
+    let mut sk = [0u8; mldsa87::SK_BYTES];
+
+    let start = Instant::now();
+    mldsa87::keypair(&mut pk, &mut sk, &seed);
+    enforce_floor_only(start, FLOOR_DSA_KEYGEN_NS);
+    let seed_res = ct_zeroize_verify(&mut seed).inspect_err(|e| METRICS.record_error_ctx(e));
+    if let Err(e) = seed_res {
+        zeroize_array(pk_out);
+        zeroize_array(sk_out);
+        zeroize_array(&mut pk);
+        let _ = ct_zeroize_verify(&mut sk).inspect_err(|err| METRICS.record_error_ctx(err));
+        return Err(e);
+    }
+
+    pk_out.copy_from_slice(&pk);
+    sk_out.copy_from_slice(&sk);
+
+    zeroize_array(&mut pk);
+    ct_zeroize_verify(&mut sk).inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    METRICS.record_ok();
+    Ok(())
+}
 
 /// Sign `msg` with ML-DSA-87 secret key bytes. Returns detached signature bytes.
 pub(crate) fn dsa_sign_into(sk: &[u8], msg: &[u8], sig_out: &mut [u8; DSA_SIG_SIZE]) -> Result<()> {
@@ -148,8 +233,10 @@ pub(crate) fn dsa_sign_into(sk: &[u8], msg: &[u8], sig_out: &mut [u8; DSA_SIG_SI
 
     let guard = TimingGuard::new("ml_dsa_sign", FLOOR_SIGN_NS);
     mldsa87::sign(sig_out, msg, sk_arr, &rnd);
-    guard.enforce()?;
-    zeroize_array(&mut rnd);
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
+    ct_zeroize_verify(&mut rnd).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     METRICS.record_ok();
     Ok(())
@@ -177,7 +264,9 @@ pub(crate) fn dsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> Result<()> {
 
     let guard = TimingGuard::new("ml_dsa_verify", FLOOR_VERIFY_NS);
     let valid = mldsa87::verify(sig_arr, msg, pk_arr);
-    guard.enforce()?;
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     if !valid {
         METRICS.record_tampering();

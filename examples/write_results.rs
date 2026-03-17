@@ -2,8 +2,10 @@
 #![allow(unsafe_code)]
 
 use crypto_bastion::{
-    compare, cut, decapsulate, decrypt, encapsulate, encrypt, hash, layer_decrypt, layer_encrypt,
-    onion, sign, verify,
+    DSA_PUBLIC_KEY_SIZE, DSA_SECRET_KEY_SIZE, DSA_SIGNATURE_SIZE, KEM_CIPHERTEXT_SIZE,
+    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, compare, cut, decapsulate, decrypt,
+    dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt, onion, sign,
+    verify,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -212,8 +214,8 @@ where
     F: FnMut(),
     G: FnMut(),
 {
-    let avg_a_ns = avg_ns(iters, || fa());
-    let avg_b_ns = avg_ns(iters, || fb());
+    let avg_a_ns = avg_ns(iters, &mut fa);
+    let avg_b_ns = avg_ns(iters, &mut fb);
     let max = avg_a_ns.max(avg_b_ns);
     let min = avg_a_ns.min(avg_b_ns);
     let ratio_ppm = if min == 0 {
@@ -324,27 +326,46 @@ fn main() -> std::io::Result<()> {
     )
     .unwrap_or(0);
 
-    let kem_pk = vec![0x55u8; 1568];
-    let kem_pk_alt = vec![0xA5u8; 1568];
-    let kem_sk = vec![0x88u8; 3168];
-    let kem_ct_in = vec![0x99u8; 1568];
-    let dsa_sk = vec![0x66u8; 4896];
-    let dsa_pk = vec![0x44u8; 2592];
-    let dsa_pk_alt = vec![0xC4u8; 2592];
+    let mut kem_pk = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_pk_alt = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_sk = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_sk_alt = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_ct_in = [0u8; KEM_CIPHERTEXT_SIZE];
+    let mut dsa_sk = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa_sk_alt = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa_pk = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_pk_alt = [0u8; DSA_PUBLIC_KEY_SIZE];
     let sign_msg = vec![0x77u8; 256];
     let sign_msg_alt = vec![0x13u8; 256];
-    let mut kem_ct_out = [0u8; 1568];
+    let mut kem_ct_out = [0u8; KEM_CIPHERTEXT_SIZE];
     let mut kem_ss_out = [0u8; 32];
     let mut kem_ss_decap = [0u8; 32];
-    let mut dsa_sig_out = [0u8; 4627];
+    let mut dsa_sig_out = [0u8; DSA_SIGNATURE_SIZE];
+    let _ = kem_keygen(&mut kem_pk, &mut kem_sk);
+    let _ = kem_keygen(&mut kem_pk_alt, &mut kem_sk_alt);
+    let _ = dsa_keygen(&mut dsa_pk, &mut dsa_sk);
+    let _ = dsa_keygen(&mut dsa_pk_alt, &mut dsa_sk_alt);
+    let _ = encapsulate(&kem_pk, &mut kem_ct_in, &mut kem_ss_out);
     let _ = sign(&dsa_sk, &sign_msg, &mut dsa_sig_out);
 
-    let kem0 = vec![0x01u8; 1568];
-    let kem1 = vec![0x02u8; 1568];
-    let kem2 = vec![0x03u8; 1568];
-    let dsa0 = vec![0x11u8; 4896];
-    let dsa1 = vec![0x22u8; 4896];
-    let dsa2 = vec![0x33u8; 4896];
+    let mut kem0 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem1 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem2 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut dsa0 = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa1 = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa2 = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut kem_sk0 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_sk1 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_sk2 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut dsa_pk0 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_pk1 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_pk2 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let _ = kem_keygen(&mut kem0, &mut kem_sk0);
+    let _ = kem_keygen(&mut kem1, &mut kem_sk1);
+    let _ = kem_keygen(&mut kem2, &mut kem_sk2);
+    let _ = dsa_keygen(&mut dsa_pk0, &mut dsa0);
+    let _ = dsa_keygen(&mut dsa_pk1, &mut dsa1);
+    let _ = dsa_keygen(&mut dsa_pk2, &mut dsa2);
     let layer_plaintext = vec![0x99u8; 128];
     let layer_plaintext_alt = vec![0x55u8; 128];
 
@@ -352,32 +373,26 @@ fn main() -> std::io::Result<()> {
     let dsa_3 = [dsa0.as_slice(), dsa1.as_slice(), dsa2.as_slice()];
     let kem_2 = [kem0.as_slice(), kem1.as_slice()];
     let dsa_2 = [dsa0.as_slice(), dsa1.as_slice()];
-    let kem_sk0 = vec![0xA1u8; 3168];
-    let kem_sk1 = vec![0xA2u8; 3168];
-    let kem_sk2 = vec![0xA3u8; 3168];
-    let dsa_pk0 = vec![0xB1u8; 2592];
-    let dsa_pk1 = vec![0xB2u8; 2592];
-    let dsa_pk2 = vec![0xB3u8; 2592];
     let kem_sks_3 = [kem_sk0.as_slice(), kem_sk1.as_slice(), kem_sk2.as_slice()];
     let dsa_pks_3 = [dsa_pk0.as_slice(), dsa_pk1.as_slice(), dsa_pk2.as_slice()];
     let kem_sks_2 = [kem_sk0.as_slice(), kem_sk1.as_slice()];
     let dsa_pks_2 = [dsa_pk0.as_slice(), dsa_pk1.as_slice()];
 
-    let mut layer_out = vec![0u8; layer_plaintext.len() + (3 * 6223)];
-    let mut layer_decrypt_out = vec![0u8; layer_plaintext.len() + (3 * 6223)];
-    let mut onion_out = vec![0u8; layer_plaintext.len() + (2 * 6223)];
-    let mut cut_out = vec![0u8; layer_plaintext.len() + (2 * 6223)];
+    let mut layer_out = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
+    let mut layer_decrypt_out = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
+    let mut onion_out = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
+    let mut cut_out = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
 
-    let mut layer_packet = vec![0u8; layer_plaintext.len() + (3 * 6223)];
+    let mut layer_packet = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
     let layer_packet_len =
         layer_encrypt(&layer_plaintext, kem_3, dsa_3, &mut layer_packet).unwrap_or(0);
-    let mut layer_packet_alt = vec![0u8; layer_plaintext_alt.len() + (3 * 6223)];
+    let mut layer_packet_alt = vec![0u8; layer_plaintext_alt.len() + (3 * LAYER_OVERHEAD)];
     let layer_packet_alt_len =
         layer_encrypt(&layer_plaintext_alt, kem_3, dsa_3, &mut layer_packet_alt).unwrap_or(0);
 
-    let mut onion_packet = vec![0u8; layer_plaintext.len() + (2 * 6223)];
+    let mut onion_packet = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
     let onion_packet_len = onion(&layer_plaintext, &kem_2, &dsa_2, &mut onion_packet).unwrap_or(0);
-    let mut onion_packet_alt = vec![0u8; layer_plaintext_alt.len() + (2 * 6223)];
+    let mut onion_packet_alt = vec![0u8; layer_plaintext_alt.len() + (2 * LAYER_OVERHEAD)];
     let onion_packet_alt_len =
         onion(&layer_plaintext_alt, &kem_2, &dsa_2, &mut onion_packet_alt).unwrap_or(0);
 
@@ -416,6 +431,10 @@ fn main() -> std::io::Result<()> {
             );
             let _ = black_box(out);
         }),
+        measure("kem_keygen", 250, || {
+            let out = kem_keygen(black_box(&mut kem_pk), black_box(&mut kem_sk));
+            let _ = black_box(out);
+        }),
         measure("encapsulate", 500, || {
             let out = encapsulate(
                 black_box(&kem_pk),
@@ -430,6 +449,10 @@ fn main() -> std::io::Result<()> {
                 black_box(&kem_ct_in),
                 black_box(&mut kem_ss_decap),
             );
+            let _ = black_box(out);
+        }),
+        measure("dsa_keygen", 80, || {
+            let out = dsa_keygen(black_box(&mut dsa_pk), black_box(&mut dsa_sk));
             let _ = black_box(out);
         }),
         measure("sign/256b", 150, || {
@@ -514,27 +537,29 @@ fn main() -> std::io::Result<()> {
         &mut ct_decrypt_tag_b,
     )
     .unwrap_or(0);
-    let mut ct_kem_ct_a = [0u8; 1568];
+    let mut ct_kem_ct_a = [0u8; KEM_CIPHERTEXT_SIZE];
     let mut ct_kem_ss_a = [0u8; 32];
-    let mut ct_kem_ct_b = [0u8; 1568];
+    let mut ct_kem_ct_b = [0u8; KEM_CIPHERTEXT_SIZE];
     let mut ct_kem_ss_b = [0u8; 32];
-    let ct_kem_sk = vec![0x8Eu8; 3168];
-    let ct_kem_ct_in_a = vec![0x9Au8; 1568];
-    let ct_kem_ct_in_b = vec![0x6Bu8; 1568];
+    let mut ct_kem_ct_in_a = [0u8; KEM_CIPHERTEXT_SIZE];
+    let mut ct_kem_ct_in_b = [0u8; KEM_CIPHERTEXT_SIZE];
+    let mut ct_kem_ss_tmp = [0u8; 32];
     let mut ct_decap_ss_a = [0u8; 32];
     let mut ct_decap_ss_b = [0u8; 32];
-    let mut ct_sig_a = [0u8; 4627];
-    let mut ct_sig_b = [0u8; 4627];
+    let mut ct_sig_a = [0u8; DSA_SIGNATURE_SIZE];
+    let mut ct_sig_b = [0u8; DSA_SIGNATURE_SIZE];
     let _ = sign(&dsa_sk, &sign_msg, &mut ct_sig_a);
-    let _ = sign(&dsa_sk, &sign_msg_alt, &mut ct_sig_b);
-    let mut ct_layer_a = vec![0u8; layer_plaintext.len() + (3 * 6223)];
-    let mut ct_layer_b = vec![0u8; layer_plaintext.len() + (3 * 6223)];
-    let mut ct_layer_decrypt_a = vec![0u8; layer_plaintext.len() + (3 * 6223)];
-    let mut ct_layer_decrypt_b = vec![0u8; layer_plaintext_alt.len() + (3 * 6223)];
-    let mut ct_onion_a = vec![0u8; layer_plaintext.len() + (2 * 6223)];
-    let mut ct_onion_b = vec![0u8; layer_plaintext.len() + (2 * 6223)];
-    let mut ct_cut_a = vec![0u8; layer_plaintext.len() + (2 * 6223)];
-    let mut ct_cut_b = vec![0u8; layer_plaintext_alt.len() + (2 * 6223)];
+    let _ = sign(&dsa_sk_alt, &sign_msg_alt, &mut ct_sig_b);
+    let _ = encapsulate(&kem_pk, &mut ct_kem_ct_in_a, &mut ct_kem_ss_tmp);
+    let _ = encapsulate(&kem_pk, &mut ct_kem_ct_in_b, &mut ct_kem_ss_tmp);
+    let mut ct_layer_a = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
+    let mut ct_layer_b = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
+    let mut ct_layer_decrypt_a = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
+    let mut ct_layer_decrypt_b = vec![0u8; layer_plaintext_alt.len() + (3 * LAYER_OVERHEAD)];
+    let mut ct_onion_a = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
+    let mut ct_onion_b = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
+    let mut ct_cut_a = vec![0u8; layer_plaintext.len() + (2 * LAYER_OVERHEAD)];
+    let mut ct_cut_b = vec![0u8; layer_plaintext_alt.len() + (2 * LAYER_OVERHEAD)];
 
     let ct_checks = vec![
         ct_check(
@@ -644,7 +669,7 @@ fn main() -> std::io::Result<()> {
             "ct_9a",
             || {
                 let _ = black_box(decapsulate(
-                    black_box(&ct_kem_sk),
+                    black_box(&kem_sk),
                     black_box(&ct_kem_ct_in_a),
                     black_box(&mut ct_decap_ss_a),
                 ));
@@ -652,7 +677,7 @@ fn main() -> std::io::Result<()> {
             "ct_6b",
             || {
                 let _ = black_box(decapsulate(
-                    black_box(&ct_kem_sk),
+                    black_box(&kem_sk),
                     black_box(&ct_kem_ct_in_b),
                     black_box(&mut ct_decap_ss_b),
                 ));
@@ -695,7 +720,7 @@ fn main() -> std::io::Result<()> {
             || {
                 let _ = black_box(verify(
                     black_box(&dsa_pk_alt),
-                    black_box(&sign_msg),
+                    black_box(&sign_msg_alt),
                     black_box(&ct_sig_b),
                 ));
             },

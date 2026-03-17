@@ -74,7 +74,7 @@ jobs:
       - name: Public API contract
         run: |
           set -euo pipefail
-          expected=(compare cut decapsulate decrypt encapsulate encrypt hash layer_decrypt layer_encrypt onion sign verify)
+          expected=(compare cut decapsulate decrypt dsa_keygen encapsulate encrypt hash kem_keygen layer_decrypt layer_encrypt onion sign verify)
           mapfile -t actual < <(grep -nE '^pub fn ' src/lib.rs | sed -E 's/.*pub fn ([A-Za-z0-9_]+).*/\1/' | sort)
           printf '%s\n' "${actual[@]}" > /tmp/actual_api.txt
           printf '%s\n' "${expected[@]}" | sort > /tmp/expected_api.txt
@@ -108,7 +108,7 @@ jobs:
           fi
 
           for section in \
-            '[decrypt/1k]' '[decapsulate]' '[verify/256b]' '[layer_decrypt/3]' '[cut/2]' \
+            '[kem_keygen]' '[dsa_keygen]' '[decrypt/1k]' '[decapsulate]' '[verify/256b]' '[layer_decrypt/3]' '[cut/2]' \
             '[ct/decrypt]' '[ct/decapsulate]' '[ct/verify]' '[ct/layer_decrypt]' '[ct/cut]'
           do
             grep -Fq "$section" results.txt

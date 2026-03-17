@@ -49,6 +49,13 @@ pub(crate) fn zeroize_array<const N: usize>(arr: &mut [u8; N]) {
     unsafe { zeroize_mem(arr.as_mut_ptr(), N) };
 }
 
+/// Zeroize an arbitrary mutable byte slice in place.
+#[inline(always)]
+pub(crate) fn zeroize_slice(buf: &mut [u8]) {
+    // SAFETY: `buf` is a valid writable slice of exactly `buf.len()` bytes.
+    unsafe { zeroize_mem(buf.as_mut_ptr(), buf.len()) };
+}
+
 /// Zeroize a 2D array of byte arrays (e.g. round key schedules).
 /// The array is contiguous in memory; total size is ROWS × COLS bytes.
 #[inline(always)]
@@ -79,6 +86,13 @@ mod tests {
         let mut buf = [0xFFu8; 1];
         zeroize_array(&mut buf);
         assert_eq!(buf, [0u8; 1]);
+    }
+
+    #[test]
+    fn zeroize_slice_clears_all_bytes() {
+        let mut buf = [0xABu8; 24];
+        zeroize_slice(&mut buf);
+        assert_eq!(buf, [0u8; 24]);
     }
 
     #[test]

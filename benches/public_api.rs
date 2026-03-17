@@ -2,13 +2,19 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use crypto_bastion::{
-    compare, cut, decapsulate, decrypt, encapsulate, encrypt, hash, layer_decrypt, layer_encrypt,
-    onion, sign, verify,
+    DSA_PUBLIC_KEY_SIZE, DSA_SECRET_KEY_SIZE, DSA_SIGNATURE_SIZE, KEM_CIPHERTEXT_SIZE,
+    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, compare, cut, decapsulate, decrypt,
+    dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt, onion, sign,
+    verify,
 };
 
+const PLAINTEXT_1K: usize = 1024;
+const SIGN_MSG_256: usize = 256;
+const LAYER_PT_128: usize = 128;
+
 fn bench_hash_compare(c: &mut Criterion) {
-    let data = vec![0xA5u8; 4096];
-    let other = vec![0x5Au8; 4096];
+    let data = [0xA5u8; 4096];
+    let other = [0x5Au8; 4096];
 
     c.bench_function("api/hash/4k", |b| {
         b.iter(|| {
@@ -36,15 +42,13 @@ fn bench_symmetric(c: &mut Criterion) {
     let key = [0x11u8; 32];
     let nonce = [0x22u8; 12];
     let aad = [0x33u8; 32];
-    let plaintext = vec![0x44u8; 1024];
-    let mut ct_out = [0u8; 1024];
+    let plaintext = [0x44u8; PLAINTEXT_1K];
+    let mut ct_out = [0u8; PLAINTEXT_1K];
     let mut tag_out = [0u8; 16];
 
-    let ct_len = match encrypt(&key, &nonce, &aad, &plaintext, &mut ct_out, &mut tag_out) {
-        Ok(n) => n,
-        Err(_) => 0,
-    };
-    let mut pt_out = [0u8; 1024];
+    let ct_len =
+        encrypt(&key, &nonce, &aad, &plaintext, &mut ct_out, &mut tag_out).unwrap_or_default();
+    let mut pt_out = [0u8; PLAINTEXT_1K];
 
     c.bench_function("api/encrypt/1k", |b| {
         b.iter(|| {
@@ -76,22 +80,33 @@ fn bench_symmetric(c: &mut Criterion) {
 }
 
 fn bench_pqc(c: &mut Criterion) {
-    let kem_pk = vec![0x55u8; 1568];
-    let kem_ct = vec![0x99u8; 1568];
-    let kem_sk = vec![0x88u8; 3168];
-    let dsa_pk = vec![0x44u8; 2592];
-    let dsa_sk = vec![0x66u8; 4896];
-    let msg = vec![0x77u8; 256];
-    let mut ct_out = [0u8; 1568];
-    let mut ss_out = [0u8; 32];
-    let mut sig_out = [0u8; 4627];
+    let mut kem_pk = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_sk = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_ct = [0u8; KEM_CIPHERTEXT_SIZE];
+    let mut kem_ss = [0u8; 32];
+
+    let mut dsa_pk = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_sk = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut sig_out = [0u8; DSA_SIGNATURE_SIZE];
+    let msg = [0x77u8; SIGN_MSG_256];
+
+    let _ = kem_keygen(&mut kem_pk, &mut kem_sk);
+    let _ = dsa_keygen(&mut dsa_pk, &mut dsa_sk);
+    let _ = sign(&dsa_sk, &msg, &mut sig_out);
+
+    c.bench_function("api/kem_keygen", |b| {
+        b.iter(|| {
+            let r = kem_keygen(black_box(&mut kem_pk), black_box(&mut kem_sk));
+            let _ = black_box(r);
+        })
+    });
 
     c.bench_function("api/encapsulate", |b| {
         b.iter(|| {
             let r = encapsulate(
                 black_box(&kem_pk),
-                black_box(&mut ct_out),
-                black_box(&mut ss_out),
+                black_box(&mut kem_ct),
+                black_box(&mut kem_ss),
             );
             let _ = black_box(r);
         })
@@ -102,8 +117,15 @@ fn bench_pqc(c: &mut Criterion) {
             let r = decapsulate(
                 black_box(&kem_sk),
                 black_box(&kem_ct),
-                black_box(&mut ss_out),
+                black_box(&mut kem_ss),
             );
+            let _ = black_box(r);
+        })
+    });
+
+    c.bench_function("api/dsa_keygen", |b| {
+        b.iter(|| {
+            let r = dsa_keygen(black_box(&mut dsa_pk), black_box(&mut dsa_sk));
             let _ = black_box(r);
         })
     });
@@ -124,35 +146,42 @@ fn bench_pqc(c: &mut Criterion) {
 }
 
 fn bench_layered(c: &mut Criterion) {
-    let plaintext = vec![0x99u8; 128];
+    let plaintext = [0x99u8; LAYER_PT_128];
 
-    let kem0 = vec![0x01u8; 1568];
-    let kem1 = vec![0x02u8; 1568];
-    let kem2 = vec![0x03u8; 1568];
-    let dsa0 = vec![0x11u8; 4896];
-    let dsa1 = vec![0x22u8; 4896];
-    let dsa2 = vec![0x33u8; 4896];
+    let mut kem_pk0 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_pk1 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_pk2 = [0u8; KEM_PUBLIC_KEY_SIZE];
+    let mut kem_sk0 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_sk1 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut kem_sk2 = [0u8; KEM_SECRET_KEY_SIZE];
+    let mut dsa_pk0 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_pk1 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_pk2 = [0u8; DSA_PUBLIC_KEY_SIZE];
+    let mut dsa_sk0 = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa_sk1 = [0u8; DSA_SECRET_KEY_SIZE];
+    let mut dsa_sk2 = [0u8; DSA_SECRET_KEY_SIZE];
 
-    let kem_pks = [kem0.as_slice(), kem1.as_slice(), kem2.as_slice()];
-    let dsa_sks = [dsa0.as_slice(), dsa1.as_slice(), dsa2.as_slice()];
-    let onion_kem = [kem0.as_slice(), kem1.as_slice()];
-    let onion_dsa = [dsa0.as_slice(), dsa1.as_slice()];
+    let _ = kem_keygen(&mut kem_pk0, &mut kem_sk0);
+    let _ = kem_keygen(&mut kem_pk1, &mut kem_sk1);
+    let _ = kem_keygen(&mut kem_pk2, &mut kem_sk2);
+    let _ = dsa_keygen(&mut dsa_pk0, &mut dsa_sk0);
+    let _ = dsa_keygen(&mut dsa_pk1, &mut dsa_sk1);
+    let _ = dsa_keygen(&mut dsa_pk2, &mut dsa_sk2);
 
-    let kem_sk0 = vec![0xA1u8; 3168];
-    let kem_sk1 = vec![0xA2u8; 3168];
-    let kem_sk2 = vec![0xA3u8; 3168];
-    let dsa_pk0 = vec![0xB1u8; 2592];
-    let dsa_pk1 = vec![0xB2u8; 2592];
-    let dsa_pk2 = vec![0xB3u8; 2592];
+    let kem_pks = [kem_pk0.as_slice(), kem_pk1.as_slice(), kem_pk2.as_slice()];
+    let dsa_sks = [dsa_sk0.as_slice(), dsa_sk1.as_slice(), dsa_sk2.as_slice()];
+    let onion_kem = [kem_pk0.as_slice(), kem_pk1.as_slice()];
+    let onion_dsa = [dsa_sk0.as_slice(), dsa_sk1.as_slice()];
+
     let kem_sks_3 = [kem_sk0.as_slice(), kem_sk1.as_slice(), kem_sk2.as_slice()];
     let dsa_pks_3 = [dsa_pk0.as_slice(), dsa_pk1.as_slice(), dsa_pk2.as_slice()];
     let kem_sks_2 = [kem_sk0.as_slice(), kem_sk1.as_slice()];
     let dsa_pks_2 = [dsa_pk0.as_slice(), dsa_pk1.as_slice()];
 
-    let mut layered_out = [0u8; 128 + 3 * 6223];
-    let mut layered_peel_out = [0u8; 128 + 3 * 6223];
-    let mut onion_out = [0u8; 128 + 2 * 6223];
-    let mut cut_out = [0u8; 128 + 2 * 6223];
+    let mut layered_out = vec![0u8; LAYER_PT_128 + 3 * LAYER_OVERHEAD];
+    let mut layered_peel_out = vec![0u8; LAYER_PT_128 + 3 * LAYER_OVERHEAD];
+    let mut onion_out = vec![0u8; LAYER_PT_128 + 2 * LAYER_OVERHEAD];
+    let mut cut_out = vec![0u8; LAYER_PT_128 + 2 * LAYER_OVERHEAD];
 
     let layered_len =
         layer_encrypt(&plaintext, kem_pks, dsa_sks, &mut layered_out).unwrap_or_default();
