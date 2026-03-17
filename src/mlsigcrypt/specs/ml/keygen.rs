@@ -82,6 +82,27 @@ pub(crate) fn keypair_with_rho(
     zeroize_array(&mut k_seed);
 }
 
+/// Generate an ML-DSA-87 key pair using a caller-supplied expanded public matrix.
+pub(crate) fn keypair_with_matrix(
+    pk: &mut [u8; PK_BYTES],
+    sk: &mut [u8; SK_BYTES],
+    seed: &[u8; 32],
+    rho: &[u8; 32],
+    mat_a: &PolyMatrix,
+) {
+    let mut expanded = [0u8; 96];
+    shake256_absorb_squeeze(&[seed.as_slice(), &[K as u8, L as u8]], &mut expanded);
+
+    let mut rho_prime: [u8; 64] = expanded[0..64].try_into().unwrap();
+    let mut k_seed: [u8; 32] = expanded[64..96].try_into().unwrap();
+
+    keypair_from_matrix(pk, sk, rho, &mut rho_prime, &mut k_seed, mat_a);
+
+    zeroize_array(&mut expanded);
+    zeroize_array(&mut rho_prime);
+    zeroize_array(&mut k_seed);
+}
+
 fn keypair_from_rho(
     pk: &mut [u8; PK_BYTES],
     sk: &mut [u8; SK_BYTES],
@@ -92,7 +113,17 @@ fn keypair_from_rho(
     // ── Step 2: Generate public matrix A in NTT domain ────────────────────────
     let mut mat_a = PolyMatrix::zero();
     expand_a(&mut mat_a, rho);
+    keypair_from_matrix(pk, sk, rho, rho_prime, k_seed, &mat_a);
+}
 
+fn keypair_from_matrix(
+    pk: &mut [u8; PK_BYTES],
+    sk: &mut [u8; SK_BYTES],
+    rho: &[u8; 32],
+    rho_prime: &mut [u8; 64],
+    k_seed: &mut [u8; 32],
+    mat_a: &PolyMatrix,
+) {
     // ── Step 3: Sample secret vectors s1 (L) and s2 (K) ──────────────────────
     let mut s1: PolyVec<L> = PolyVec::zero();
     let mut s2: PolyVec<K> = PolyVec::zero();

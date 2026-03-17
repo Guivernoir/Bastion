@@ -13,7 +13,7 @@ the primitive implementations it depends on.
 
 ## `specs/` Modules
 
-- `algebraic.rs` — exact algebraic encapsulation helpers used by the level-3 packet path
+- `algebraic.rs` — noisy algebraic encapsulation helpers used by the level-3 packet path
 - `keccak.rs` — shared Keccak sponge and SHAKE-128 helper for transcript, XOF, and keystream logic
 - `sha512.rs` — consolidated SHA3-512 and SHA-512 helpers used by key derivation and spec-level hashing
 - `ml/` — ML-DSA-87 signature internals and shared lattice arithmetic

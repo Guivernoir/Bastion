@@ -239,6 +239,21 @@ pub(crate) fn signcrypt(
         return Err(SigncryptOpenFailed);
     }
 
+    let mut recipient_pk = PolyVec::<{ algebraic::ENC_K }>::zero();
+    let recipient_pk_ok = algebraic::decode_public_key(pk_user_r.pk_enc(), &mut recipient_pk);
+    debug_assert!(recipient_pk_ok, "validated recipient key must decode");
+    if !recipient_pk_ok {
+        return Err(SigncryptOpenFailed);
+    }
+
+    let mut recipient_pk_hat = PolyVec::<{ algebraic::ENC_K }>::zero();
+    for i in 0..algebraic::ENC_K {
+        recipient_pk_hat.polys[i]
+            .coeffs
+            .copy_from_slice(&recipient_pk.polys[i].coeffs);
+        recipient_pk_hat.polys[i].ntt();
+    }
+
     out[PKT_ALG_ID_OFF..PKT_VERSION_OFF].copy_from_slice(ALG_ID);
     out[PKT_VERSION_OFF] = VERSION;
     out[PKT_KEY_ID_S_OFF..PKT_KEY_ID_S_OFF + KEY_ID_LEN].copy_from_slice(pk_user_s.key_id());
@@ -284,6 +299,8 @@ pub(crate) fn signcrypt(
 
     let mut mat_a = PolyMatrix::zero();
     expand_a(&mut mat_a, &rho);
+    let mut encap_mat_a = PolyMatrix::zero();
+    expand_a(&mut encap_mat_a, pk_user_r.rho_shared());
 
     let ct_len_be = (pt_len as u64).to_be_bytes();
     out[PKT_CT_LEN_OFF..PKT_CT_OFF].copy_from_slice(&ct_len_be);
@@ -305,6 +322,7 @@ pub(crate) fn signcrypt(
     let mut w1_packed = [0u8; K * POLYW1_BYTES];
     let mut encap = [0u8; ENCAP_LEN];
     let mut message_key = Secret::<32>::new();
+    fill_os_random_array(&mut message_key.0).map_err(|_| SigncryptOpenFailed)?;
 
     'outer: loop {
         expand_mask(&mut y, &rho_prime, kappa);
@@ -340,16 +358,13 @@ pub(crate) fn signcrypt(
             polyw1_pack(packed, &w1.polys[i]);
         }
 
-        if !algebraic::encapsulate_from_mask(
-            pk_user_r.rho_shared(),
-            pk_user_r.pk_enc(),
-            &y_hat,
+        algebraic::encapsulate_from_mask(
+            &encap_mat_a,
+            &recipient_pk_hat,
+            &y,
+            &message_key.0,
             &mut encap,
-            &mut message_key.0,
-        ) {
-            zeroize_slice(out);
-            return Err(SigncryptOpenFailed);
-        }
+        );
 
         out[PKT_CT_OFF..PKT_CT_OFF + pt_len].copy_from_slice(plaintext);
         xor_keystream_in_place(
@@ -463,6 +478,8 @@ pub(crate) fn signcrypt(
     zeroize_polyvec(&mut ct0);
     zeroize_polyvec(&mut z);
     zeroize_polyvec(&mut h);
+    zeroize_polyvec(&mut recipient_pk);
+    zeroize_polyvec(&mut recipient_pk_hat);
     zeroize_poly(&mut c_hat);
     zeroize_array(&mut rho);
     zeroize_array(&mut k_seed);

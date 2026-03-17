@@ -11,9 +11,9 @@
 /// - `S_E` produces the payload keystream from the derived message key,
 ///   sender/recipient `key_id`, and the `encap` field
 ///
-/// The current implementation uses an exact 23-bit encoding for the algebraic
-/// encapsulation vector, so the concrete packet overhead is larger than the
-/// rough estimate in the merge draft.
+/// The current implementation uses a noisy algebraic `u || v` encapsulation
+/// with exact 23-bit coefficient encoding, so the concrete packet overhead is
+/// larger than the rough compressed estimate in the merge draft.
 ///
 /// # Packet format
 ///
@@ -22,7 +22,7 @@
 /// [1]      version = 0x03
 /// [32]     key_id_S
 /// [32]     key_id_R
-/// [2944]   encap
+/// [3680]   encap = u || v
 /// [4480]   z
 /// [64]     c_tilde
 /// [83]     h
@@ -30,7 +30,7 @@
 /// [N]      ct
 /// ```
 ///
-/// Fixed overhead: 7657 bytes.
+/// Fixed overhead: 8393 bytes.
 ///
 /// # Security invariants
 ///

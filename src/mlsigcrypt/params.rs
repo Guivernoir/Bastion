@@ -55,7 +55,7 @@ pub(crate) const SIG_SK_LEN: usize = crate::mlsigcrypt::specs::ml::SK_BYTES;
 /// Exact encoded recipient encapsulation public key size.
 pub(crate) const ENC_PK_LEN: usize = crate::mlsigcrypt::specs::algebraic::PUBLIC_KEY_BYTES;
 
-/// Exact encoded algebraic encapsulation packet field size.
+/// Exact encoded algebraic encapsulation packet field size (`u || v`).
 pub(crate) const ENCAP_LEN: usize = crate::mlsigcrypt::specs::algebraic::ENCAP_BYTES;
 
 /// ML-DSA commitment hash size.
@@ -95,15 +95,15 @@ pub(crate) const PACKET_FIXED_OVERHEAD: usize = ALG_ID_LEN
 const _: () = {
     assert!(ALG_ID.len() == ALG_ID_LEN, "ALG_ID_LEN mismatch");
     assert!(ENC_PK_LEN == 2944, "ENC_PK_LEN must be 2944");
-    assert!(ENCAP_LEN == 2944, "ENCAP_LEN must be 2944");
+    assert!(ENCAP_LEN == 3680, "ENCAP_LEN must be 3680");
     assert!(SIG_PK_LEN == 2592, "SIG_PK_LEN must be 2592");
     assert!(SIG_SK_LEN == 4896, "SIG_SK_LEN must be 4896");
     assert!(SIG_Z_LEN == 4480, "SIG_Z_LEN must be 4480");
     assert!(SIG_CTILDE_LEN == 64, "SIG_CTILDE_LEN must be 64");
     assert!(SIG_HINT_LEN == 83, "SIG_HINT_LEN must be 83");
     assert!(
-        PACKET_FIXED_OVERHEAD == 7657,
-        "PACKET_FIXED_OVERHEAD must be 7657"
+        PACKET_FIXED_OVERHEAD == 8393,
+        "PACKET_FIXED_OVERHEAD must be 8393"
     );
-    assert!(PKT_CT_OFF == 7657, "PKT_CT_OFF must be 7657");
+    assert!(PKT_CT_OFF == 8393, "PKT_CT_OFF must be 8393");
 };

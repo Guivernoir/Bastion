@@ -14,6 +14,9 @@ use super::params::*;
 use crate::mlsigcrypt::specs::algebraic;
 use crate::mlsigcrypt::specs::keccak::shake128;
 use crate::mlsigcrypt::specs::ml;
+use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
+use crate::mlsigcrypt::specs::ml::packing::{unpack_pk_rho, unpack_sk_rho};
+use crate::mlsigcrypt::specs::ml::sampling::expand_a;
 use crate::mlsigcrypt::specs::sha512::sha3_512_hash as sha3_512;
 use crate::zeroize::zeroize_mem;
 
@@ -101,9 +104,13 @@ pub(crate) struct UserPublicKey {
 
 impl UserPublicKey {
     pub(super) fn verify_consistency(&self) -> bool {
-        if self.pk_sig[..MATRIX_SEED_LEN] != self.rho_shared {
+        let mut pk_sig_rho = [0u8; MATRIX_SEED_LEN];
+        unpack_pk_rho(&mut pk_sig_rho, &self.pk_sig);
+        if pk_sig_rho != self.rho_shared {
+            unsafe { zeroize_mem(pk_sig_rho.as_mut_ptr(), MATRIX_SEED_LEN) };
             return false;
         }
+        unsafe { zeroize_mem(pk_sig_rho.as_mut_ptr(), MATRIX_SEED_LEN) };
 
         let mut expected = [0u8; KEY_ID_LEN];
         compute_key_id(&self.rho_shared, &self.pk_enc, &self.pk_sig, &mut expected);
@@ -198,9 +205,13 @@ pub(crate) fn decode_secret_key(bytes: &[u8]) -> Option<(UserSecretKey, UserPubl
     if derived_rho != public_key.rho_shared {
         return None;
     }
-    if sk_sig[..MATRIX_SEED_LEN] != derived_rho {
+    let mut sk_sig_rho = [0u8; MATRIX_SEED_LEN];
+    unpack_sk_rho(&mut sk_sig_rho, &sk_sig);
+    if sk_sig_rho != derived_rho {
+        unsafe { zeroize_mem(sk_sig_rho.as_mut_ptr(), MATRIX_SEED_LEN) };
         return None;
     }
+    unsafe { zeroize_mem(sk_sig_rho.as_mut_ptr(), MATRIX_SEED_LEN) };
 
     let mut expected_pk_enc = [0u8; ENC_PK_LEN];
     algebraic::derive_public_key(&derived_rho, &sk_enc_seed, &mut expected_pk_enc);
@@ -242,12 +253,15 @@ pub(crate) fn keygen(msk: &[u8; MASTER_SECRET_LEN]) -> (UserSecretKey, UserPubli
     let mut sig_seed = [0u8; 32];
     sig_seed.copy_from_slice(&sig_seed_full[..32]);
 
+    let mut mat_a = PolyMatrix::zero();
+    expand_a(&mut mat_a, &rho_shared);
+
     let mut pk_enc = [0u8; ENC_PK_LEN];
-    algebraic::derive_public_key(&rho_shared, &sk_enc_seed, &mut pk_enc);
+    algebraic::derive_public_key_from_matrix(&mat_a, &sk_enc_seed, &mut pk_enc);
 
     let mut pk_sig = [0u8; SIG_PK_LEN];
     let mut sk_sig = [0u8; SIG_SK_LEN];
-    ml::keypair_with_rho(&mut pk_sig, &mut sk_sig, &sig_seed, &rho_shared);
+    ml::keypair_with_matrix(&mut pk_sig, &mut sk_sig, &sig_seed, &rho_shared, &mat_a);
 
     let mut key_id = [0u8; KEY_ID_LEN];
     compute_key_id(&rho_shared, &pk_enc, &pk_sig, &mut key_id);

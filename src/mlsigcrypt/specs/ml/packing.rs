@@ -288,6 +288,11 @@ pub(crate) fn unpack_pk(rho: &mut [u8; 32], t1: &mut PolyVec<K>, pk: &[u8; PK_BY
     }
 }
 
+/// Decode only the matrix-seed prefix ρ from an ML public key.
+pub(crate) fn unpack_pk_rho(rho: &mut [u8; 32], pk: &[u8; PK_BYTES]) {
+    rho.copy_from_slice(&pk[PK_RHO_OFF..PK_T1_OFF]);
+}
+
 // ── Secret key ────────────────────────────────────────────────────────────────
 
 /// Encode (ρ, K_seed, tr, s1, s2, t0) → SK_BYTES = 4896 bytes.
@@ -359,6 +364,11 @@ pub(crate) fn unpack_sk(
             sk[start..start + POLYT0_BYTES].try_into().unwrap(),
         );
     }
+}
+
+/// Decode only the matrix-seed prefix ρ from an ML secret key.
+pub(crate) fn unpack_sk_rho(rho: &mut [u8; 32], sk: &[u8; SK_BYTES]) {
+    rho.copy_from_slice(&sk[SK_RHO_OFF..SK_RHO_OFF + 32]);
 }
 
 // ── Signature ─────────────────────────────────────────────────────────────────

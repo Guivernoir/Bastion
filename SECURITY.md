@@ -33,7 +33,7 @@ guarantees.
 ## Cryptographic Components
 
 - SHAKE-256 for the MLSigcrypt-v3 payload keystream and fused challenge derivation.
-- A custom algebraic encapsulation over the ML-DSA ring for packet confidentiality.
+- A custom noisy algebraic `u || v` encapsulation over the ML-DSA ring for packet confidentiality.
 - ML-DSA-87 response/hint machinery for outsider-verifiable authenticity.
 - SHA3-512 for key derivation, key identifiers, and AAD normalization.
 
@@ -99,8 +99,8 @@ microarchitectural constant-time proofs.
 - Public cryptographic operations use caller-owned buffers instead of returning
   heap-backed containers.
 - The current level-3 implementation uses an exact 23-bit encoding for the
-  recipient encapsulation vector, so packet overhead is 7657 bytes rather than
-  the merge draft's rough compressed estimate.
+  recipient `u || v` encapsulation, so packet overhead is 8393 bytes rather
+  than the merge draft's rough compressed estimate.
 - `examples/write_results.rs` measures allocator activity, RSS deltas, and
   timing spread for the public API.
 
