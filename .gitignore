@@ -2,6 +2,7 @@
 /results.txt
 /criterion/
 1.0.0.md
+merge docs/
 
 # Fuzzing artifacts
 /fuzz/target/

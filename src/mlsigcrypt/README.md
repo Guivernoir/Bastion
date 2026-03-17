@@ -1,11 +1,11 @@
 # MLSigcrypt Internal Layout
 
-This directory contains the internal MLSigcrypt-v1 protocol code plus the
+This directory contains the internal MLSigcrypt-v2 protocol code plus the
 primitive implementations it depends on.
 
 ## Root Modules
 
-- `mod.rs` — MLSigcrypt-v1 module root, integration tests, and byte-buffer entry points
+- `mod.rs` — MLSigcrypt-v2 module root, integration tests, and byte-buffer entry points
 - `keys.rs` — unified identity key types, encoding, decoding, and deterministic key derivation
 - `params.rs` — protocol constants, sizes, offsets, and packet layout
 - `signcrypt.rs` — signcrypt / unsigncrypt packet processing
@@ -13,10 +13,8 @@ primitive implementations it depends on.
 
 ## `specs/` Modules
 
-- `sha3_512.rs` — SHA3-512 used by transcript hashing, key IDs, and nonce derivation
-- `hkdf.rs` — HKDF-SHA3-512 used for seed and session-key derivation
-- `sha512.rs` — SHA-512 implementation used by the crate-level public `hash()` API
-- `aes256gcm/` — AES-256-GCM authenticated encryption
+- `sha3_512.rs` — SHA3-512 used by key derivation, key IDs, and AAD normalization
+- `sha512.rs` — SHA-512 implementation retained as an internal spec module
 - `mlkem1024/` — ML-KEM-1024 encapsulation internals
 - `mldsa87/` — ML-DSA-87 signature internals
 

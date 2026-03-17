@@ -1,10 +1,10 @@
 [package]
 name = "crypto_bastion"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
 license = "MIT OR Apache-2.0"
-description = "Hardened post-quantum cryptographic primitives with zero-trust architecture"
+description = "Hardened post-quantum MLSigcrypt signcryption crate"
 repository = "https://github.com/Guivernoir/Bastion"
 documentation = "https://docs.rs/crypto_bastion"
 readme = "README.md"

@@ -1,8 +1,8 @@
 #![no_main]
 
 use crypto_bastion::{
-    MLSIGCRYPT_V1_PACKET_OVERHEAD, MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, MLSIGCRYPT_V1_SECRET_KEY_SIZE,
-    compare, mlsigcrypt_v1_keygen, mlsigcrypt_v1_signcrypt, mlsigcrypt_v1_unsigncrypt,
+    MLSIGCRYPT_PACKET_OVERHEAD, MLSIGCRYPT_PUBLIC_KEY_SIZE, MLSIGCRYPT_SECRET_KEY_SIZE,
+    mlsigcrypt_keygen, mlsigcrypt_signcrypt, mlsigcrypt_unsigncrypt,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -31,19 +31,15 @@ fuzz_target!(|data: &[u8]| {
         *byte = data.get(2 + aad_len + idx).copied().unwrap_or(0) ^ 0xA5;
     }
 
-    let sender_pk = expand_vec(data, MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, 0x11);
-    let sender_sk = expand_vec(data, MLSIGCRYPT_V1_SECRET_KEY_SIZE, 0x22);
-    let recipient_pk = expand_vec(data, MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, 0x33);
-    let recipient_sk = expand_vec(data, MLSIGCRYPT_V1_SECRET_KEY_SIZE, 0x44);
-    let mut malformed_packet = expand_vec(
-        data,
-        MLSIGCRYPT_V1_PACKET_OVERHEAD + msg.len(),
-        0x55,
-    );
+    let sender_pk = expand_vec(data, MLSIGCRYPT_PUBLIC_KEY_SIZE, 0x11);
+    let sender_sk = expand_vec(data, MLSIGCRYPT_SECRET_KEY_SIZE, 0x22);
+    let recipient_pk = expand_vec(data, MLSIGCRYPT_PUBLIC_KEY_SIZE, 0x33);
+    let recipient_sk = expand_vec(data, MLSIGCRYPT_SECRET_KEY_SIZE, 0x44);
+    let mut malformed_packet = expand_vec(data, MLSIGCRYPT_PACKET_OVERHEAD + msg.len(), 0x55);
     let mut malformed_out = vec![0u8; msg.len()];
 
-    let _ = mlsigcrypt_v1_signcrypt(&sender_sk, &recipient_pk, &aad, &msg, &mut malformed_packet);
-    let _ = mlsigcrypt_v1_unsigncrypt(
+    let _ = mlsigcrypt_signcrypt(&sender_sk, &recipient_pk, &aad, &msg, &mut malformed_packet);
+    let _ = mlsigcrypt_unsigncrypt(
         &recipient_sk,
         &sender_pk,
         &aad,
@@ -51,31 +47,31 @@ fuzz_target!(|data: &[u8]| {
         &mut malformed_out,
     );
 
-    let mut real_sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
-    let mut real_sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
-    let mut real_recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
-    let mut real_recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut real_sender_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];
+    let mut real_sender_sk = [0u8; MLSIGCRYPT_SECRET_KEY_SIZE];
+    let mut real_recipient_pk = [0u8; MLSIGCRYPT_PUBLIC_KEY_SIZE];
+    let mut real_recipient_sk = [0u8; MLSIGCRYPT_SECRET_KEY_SIZE];
 
-    if mlsigcrypt_v1_keygen(&mut real_sender_pk, &mut real_sender_sk).is_ok()
-        && mlsigcrypt_v1_keygen(&mut real_recipient_pk, &mut real_recipient_sk).is_ok()
+    if mlsigcrypt_keygen(&mut real_sender_pk, &mut real_sender_sk).is_ok()
+        && mlsigcrypt_keygen(&mut real_recipient_pk, &mut real_recipient_sk).is_ok()
     {
-        let mut packet = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + msg.len()];
+        let mut packet = vec![0u8; MLSIGCRYPT_PACKET_OVERHEAD + msg.len()];
         let mut opened = vec![0u8; msg.len()];
-        if let Ok(packet_len) = mlsigcrypt_v1_signcrypt(
+        if let Ok(packet_len) = mlsigcrypt_signcrypt(
             &real_sender_sk,
             &real_recipient_pk,
             &aad,
             &msg,
             &mut packet,
         ) {
-            if let Ok(opened_len) = mlsigcrypt_v1_unsigncrypt(
+            if let Ok(opened_len) = mlsigcrypt_unsigncrypt(
                 &real_recipient_sk,
                 &real_sender_pk,
                 &aad,
                 &packet[..packet_len],
                 &mut opened,
             ) {
-                assert!(compare(&opened[..opened_len], &msg));
+                assert_eq!(&opened[..opened_len], msg.as_slice());
             }
 
             let mut wrong_aad = aad.clone();
@@ -84,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
             } else {
                 wrong_aad.push(0x01);
             }
-            let _ = mlsigcrypt_v1_unsigncrypt(
+            let _ = mlsigcrypt_unsigncrypt(
                 &real_recipient_sk,
                 &real_sender_pk,
                 &wrong_aad,
@@ -97,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
                 let index = data.get(2).copied().unwrap_or(0) as usize % tampered.len();
                 tampered[index] ^= 0x01;
             }
-            let _ = mlsigcrypt_v1_unsigncrypt(
+            let _ = mlsigcrypt_unsigncrypt(
                 &real_recipient_sk,
                 &real_sender_pk,
                 &aad,

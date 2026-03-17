@@ -1,10 +1,10 @@
-/// MLSigcrypt-v1 key types and key generation.
+/// MLSigcrypt-v2 key types and key generation.
 ///
 /// Key hierarchy:
 ///   msk (32 bytes, uniform random)
-///     ├─ KDF(msk, "MLSigcrypt-v1/kem_seed", 64) → kem_seed
+///     ├─ SHA3-512("MLSigcrypt-v1/kem_seed" || msk)[0..64] → kem_seed
 ///     │     └─ ML-KEM-1024.KeyGen(kem_seed) → (sk_enc, pk_enc)
-///     └─ KDF(msk, "MLSigcrypt-v1/sig_seed", 32) → sig_seed
+///     └─ SHA3-512("MLSigcrypt-v1/sig_seed" || msk)[0..32] → sig_seed
 ///           └─ ML-DSA-87.KeyGen(sig_seed) → (sk_sig, pk_sig)
 ///
 ///   key_id = Truncate32(SHA3-512("MLSigcrypt-v1/key_id" || pk_enc || pk_sig))
@@ -12,7 +12,6 @@
 /// `UserSecretKey` holds both subordinate secret keys in one struct and is
 /// zeroized on Drop. `UserPublicKey` is freely copyable (no secret data).
 use super::params::*;
-use crate::mlsigcrypt::specs::hkdf::kdf;
 use crate::mlsigcrypt::specs::mldsa87;
 use crate::mlsigcrypt::specs::mlkem1024::{self, DecapKey, EncapKey};
 use crate::mlsigcrypt::specs::sha3_512::hash as sha3_512;
@@ -170,11 +169,13 @@ pub(crate) fn keygen(msk: &[u8; MASTER_SECRET_LEN]) -> (UserSecretKey, UserPubli
     // ── Step 1: Derive a 64-byte seed for ML-KEM-1024 ────────────────────────
     // ML-KEM-1024.KeyGen requires 64 bytes (d || z per FIPS 203 §6.1).
     let mut kem_seed = [0u8; 64];
-    kdf(msk, b"MLSigcrypt-v1/kem_seed", &mut kem_seed);
+    sha3_512(&[b"MLSigcrypt-v1/kem_seed", msk], &mut kem_seed);
 
     // ── Step 2: Derive a 32-byte seed for ML-DSA-87 ──────────────────────────
     let mut sig_seed = [0u8; 32];
-    kdf(msk, b"MLSigcrypt-v1/sig_seed", &mut sig_seed);
+    let mut sig_seed_full = [0u8; SHA3_512_OUT];
+    sha3_512(&[b"MLSigcrypt-v1/sig_seed", msk], &mut sig_seed_full);
+    sig_seed.copy_from_slice(&sig_seed_full[..32]);
 
     // ── Step 3: Generate ML-KEM-1024 keypair ─────────────────────────────────
     let mut ek = EncapKey([0u8; KEM_EK_LEN]);
@@ -217,6 +218,7 @@ pub(crate) fn keygen(msk: &[u8; MASTER_SECRET_LEN]) -> (UserSecretKey, UserPubli
     unsafe {
         zeroize_mem(kem_seed.as_mut_ptr(), 64);
         zeroize_mem(sig_seed.as_mut_ptr(), 32);
+        zeroize_mem(sig_seed_full.as_mut_ptr(), SHA3_512_OUT);
         zeroize_mem(hash.as_mut_ptr(), SHA3_512_OUT);
     }
 

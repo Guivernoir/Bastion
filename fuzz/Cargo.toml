@@ -14,36 +14,8 @@ libfuzzer-sys = "0.4"
 path = ".."
 
 [[bin]]
-name = "fuzz_hash_compare"
-path = "fuzz_targets/fuzz_hash_compare.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_encrypt_api"
-path = "fuzz_targets/fuzz_encrypt_api.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_encaps_sign_api"
-path = "fuzz_targets/fuzz_encaps_sign_api.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_onion_api"
-path = "fuzz_targets/fuzz_onion_api.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_mlsigcrypt_v1_api"
-path = "fuzz_targets/fuzz_mlsigcrypt_v1_api.rs"
+name = "fuzz_mlsigcrypt_api"
+path = "fuzz_targets/fuzz_mlsigcrypt_api.rs"
 test = false
 doc = false
 bench = false
