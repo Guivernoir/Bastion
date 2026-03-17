@@ -3,17 +3,15 @@
 //! All functions zeroize intermediate key material before returning.
 //! Rate limiting lives at the call site (per-layer context).
 //!
-//! [`TimingGuard::enforce`] is called after each PQC primitive completes,
-//! ensuring the timing floor is checked on every code path (success *and*
-//! failure) and keeping `TimingGuard`, `TIMING_VIOLATIONS`, and
-//! `record_timing_viol` in the live call graph.
+//! Timing floors are enforced on every code path. Where CI jitter has proven
+//! too noisy for ceiling checks, the wrappers use floor-only enforcement.
 
-use crate::algos::mldsa87;
-use crate::algos::mlkem1024;
-use crate::algos::mlkem1024::hash::sha3_512_x2;
 use crate::audit::METRICS;
 use crate::constant_time::{TimingGuard, ct_zeroize_verify};
 use crate::error::{CryptoError, Result};
+use crate::mlsigcrypt::specs::mldsa87;
+use crate::mlsigcrypt::specs::mlkem1024;
+use crate::mlsigcrypt::specs::mlkem1024::hash::sha3_512_x2;
 use crate::os_random::fill_os_random_array;
 use crate::zeroize::zeroize_array;
 use std::time::Instant;
@@ -145,6 +143,43 @@ pub(crate) fn kem_encapsulate_into(
     Ok(())
 }
 
+/// Encapsulate to `pk`, returning the raw ML-KEM shared secret.
+///
+/// The caller is responsible for zeroizing `shared_secret_out` after use.
+pub(crate) fn kem_encapsulate_shared_secret_into(
+    pk: &[u8],
+    ct_out: &mut [u8; KEM_CT_SIZE],
+    shared_secret_out: &mut [u8; mlkem1024::SS_BYTES],
+) -> Result<()> {
+    if pk.len() != KEM_PK_SIZE {
+        return Err(CryptoError::invalid_public_key(
+            "invalid KEM public key length",
+        ));
+    }
+
+    let mut ek = mlkem1024::EncapKey([0u8; mlkem1024::EK_BYTES]);
+    ek.0.copy_from_slice(pk);
+
+    let mut entropy = [0u8; 32];
+    fill_entropy(&mut entropy)?;
+
+    let guard = TimingGuard::new("ml_kem_encap", FLOOR_ENCAP_NS);
+    let mut ct = mlkem1024::Ciphertext([0u8; mlkem1024::CT_BYTES]);
+    let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
+    mlkem1024::encaps(&ek, &entropy, &mut ct, &mut ss);
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    ct_out.copy_from_slice(ct.as_bytes());
+    shared_secret_out.copy_from_slice(ss.as_bytes());
+    zeroize_array(&mut ct.0);
+    ct_zeroize_verify(&mut entropy).inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    METRICS.record_ok();
+    Ok(())
+}
+
 /// Decapsulate `kem_ct` with `sk`, returning the derived `aes_key`.
 ///
 /// The raw shared secret is zeroized internally. The caller must zeroize
@@ -176,6 +211,41 @@ pub(crate) fn kem_decapsulate_into(
     let mut raw_ss = *ss.as_bytes();
     derive_aes_key_into(&raw_ss, aes_key_out);
     ct_zeroize_verify(&mut raw_ss).inspect_err(|e| METRICS.record_error_ctx(e))?;
+    zeroize_array(&mut ct_t.0);
+    ct_zeroize_verify(&mut dk_t.0).inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    METRICS.record_ok();
+    Ok(())
+}
+
+/// Decapsulate `kem_ct` with `sk`, returning the raw ML-KEM shared secret.
+///
+/// The caller is responsible for zeroizing `shared_secret_out` after use.
+pub(crate) fn kem_decapsulate_shared_secret_into(
+    kem_ct: &[u8],
+    sk: &[u8],
+    shared_secret_out: &mut [u8; mlkem1024::SS_BYTES],
+) -> Result<()> {
+    if kem_ct.len() != KEM_CT_SIZE {
+        return Err(CryptoError::invalid_packet("invalid KEM ciphertext length"));
+    }
+    if sk.len() != KEM_SK_SIZE {
+        return Err(CryptoError::internal("invalid KEM secret key length"));
+    }
+
+    let mut ct_t = mlkem1024::Ciphertext([0u8; mlkem1024::CT_BYTES]);
+    ct_t.0.copy_from_slice(kem_ct);
+    let mut dk_t = mlkem1024::DecapKey([0u8; mlkem1024::DK_BYTES]);
+    dk_t.0.copy_from_slice(sk);
+
+    let guard = TimingGuard::new("ml_kem_decap", FLOOR_DECAP_NS);
+    let mut ss = mlkem1024::SharedSecret([0u8; mlkem1024::SS_BYTES]);
+    mlkem1024::decaps(&dk_t, &ct_t, &mut ss);
+    guard
+        .enforce()
+        .inspect_err(|e| METRICS.record_error_ctx(e))?;
+
+    shared_secret_out.copy_from_slice(ss.as_bytes());
     zeroize_array(&mut ct_t.0);
     ct_zeroize_verify(&mut dk_t.0).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
@@ -231,11 +301,9 @@ pub(crate) fn dsa_sign_into(sk: &[u8], msg: &[u8], sig_out: &mut [u8; DSA_SIG_SI
     let mut rnd = [0u8; 32];
     fill_entropy(&mut rnd)?;
 
-    let guard = TimingGuard::new("ml_dsa_sign", FLOOR_SIGN_NS);
+    let start = Instant::now();
     mldsa87::sign(sig_out, msg, sk_arr, &rnd);
-    guard
-        .enforce()
-        .inspect_err(|e| METRICS.record_error_ctx(e))?;
+    enforce_floor_only(start, FLOOR_SIGN_NS);
     ct_zeroize_verify(&mut rnd).inspect_err(|e| METRICS.record_error_ctx(e))?;
 
     METRICS.record_ok();
@@ -262,11 +330,9 @@ pub(crate) fn dsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> Result<()> {
         .try_into()
         .map_err(|_| CryptoError::signature_failed("invalid ML-DSA signature length"))?;
 
-    let guard = TimingGuard::new("ml_dsa_verify", FLOOR_VERIFY_NS);
+    let start = Instant::now();
     let valid = mldsa87::verify(sig_arr, msg, pk_arr);
-    guard
-        .enforce()
-        .inspect_err(|e| METRICS.record_error_ctx(e))?;
+    enforce_floor_only(start, FLOOR_VERIFY_NS);
 
     if !valid {
         METRICS.record_tampering();

@@ -9,6 +9,9 @@
 //! - [`dsa_keygen`]: ML-DSA-87 key generation
 //! - [`sign`]: ML-DSA-87 detached signature
 //! - [`verify`]: ML-DSA-87 signature verification
+//! - [`mlsigcrypt_v1_keygen`]: MLSigcrypt-v1 unified key generation
+//! - [`mlsigcrypt_v1_signcrypt`]: MLSigcrypt-v1 signcryption
+//! - [`mlsigcrypt_v1_unsigncrypt`]: MLSigcrypt-v1 signcryption open
 //! - [`hash`]: SHA-512 digest
 //! - [`compare`]: constant-time byte-slice equality
 //! - [`layer_encrypt`]: fixed 3-layer hybrid onion
@@ -22,21 +25,22 @@
 #![warn(clippy::unwrap_used, clippy::panic)]
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
-mod algos;
 mod audit;
 mod constant_time;
 mod error;
+mod mlsigcrypt;
 mod os_random;
 mod pqc;
 mod zeroize;
 
 use error::{CryptoError, Result};
 
-use crate::algos::aes256gcm::aes::Key256;
-use crate::algos::aes256gcm::{Aes256Gcm, Nonce};
 use crate::constant_time::{
     ct_copy_if, ct_eq, ct_hamming_weight, ct_in_range, ct_mod_reduce, ct_xor,
 };
+use crate::mlsigcrypt as mlsigcrypt_v1;
+use crate::mlsigcrypt::specs::aes256gcm::aes::Key256;
+use crate::mlsigcrypt::specs::aes256gcm::{Aes256Gcm, Nonce};
 use crate::os_random::fill_os_random_array;
 use crate::zeroize::{zeroize_array, zeroize_slice};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +58,12 @@ pub const DSA_PUBLIC_KEY_SIZE: usize = pqc::DSA_PK_SIZE;
 pub const DSA_SECRET_KEY_SIZE: usize = pqc::DSA_SK_SIZE;
 /// ML-DSA-87 detached signature size (bytes).
 pub const DSA_SIGNATURE_SIZE: usize = pqc::DSA_SIG_SIZE;
+/// MLSigcrypt-v1 public identity size (bytes).
+pub const MLSIGCRYPT_V1_PUBLIC_KEY_SIZE: usize = mlsigcrypt_v1::PUBLIC_KEY_SIZE;
+/// MLSigcrypt-v1 unified secret key size (bytes).
+pub const MLSIGCRYPT_V1_SECRET_KEY_SIZE: usize = mlsigcrypt_v1::SECRET_KEY_SIZE;
+/// MLSigcrypt-v1 per-packet fixed overhead excluding payload ciphertext (bytes).
+pub const MLSIGCRYPT_V1_PACKET_OVERHEAD: usize = mlsigcrypt_v1::PACKET_OVERHEAD;
 /// AES-GCM nonce size (bytes).
 pub const NONCE_SIZE: usize = 12;
 /// AES-GCM authentication tag size (bytes).
@@ -77,6 +87,9 @@ const FLOOR_PUBLIC_DECAPSULATE_NS: u64 = 1_200_000;
 const FLOOR_PUBLIC_DSA_KEYGEN_NS: u64 = 300_000;
 const FLOOR_PUBLIC_SIGN_NS: u64 = 300_000;
 const FLOOR_PUBLIC_VERIFY_NS: u64 = 2_700_000;
+const FLOOR_PUBLIC_MLSIGCRYPT_V1_KEYGEN_NS: u64 = 18_000_000;
+const FLOOR_PUBLIC_MLSIGCRYPT_V1_SIGNCRYPT_NS: u64 = 14_000_000;
+const FLOOR_PUBLIC_MLSIGCRYPT_V1_UNSIGNCRYPT_NS: u64 = 5_000_000;
 const FLOOR_PUBLIC_HASH_NS: u64 = 40_000;
 const FLOOR_PUBLIC_COMPARE_NS: u64 = 40_000;
 const FLOOR_PUBLIC_LAYER_NS: u64 = 800_000;
@@ -537,10 +550,77 @@ pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     len_ok && valid
 }
 
+/// MLSigcrypt-v1 unified key generation.
+pub fn mlsigcrypt_v1_keygen(
+    pk_user_out: &mut [u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE],
+    sk_user_out: &mut [u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE],
+) -> std::result::Result<(), &'static str> {
+    let start = Instant::now();
+
+    let result = match mlsigcrypt_v1::keygen_into(pk_user_out, sk_user_out) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            zeroize_array(pk_user_out);
+            zeroize_array(sk_user_out);
+            Err("mlsigcrypt-v1 key generation failed")
+        }
+    };
+
+    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_V1_KEYGEN_NS);
+    result
+}
+
+/// MLSigcrypt-v1 signcryption.
+pub fn mlsigcrypt_v1_signcrypt(
+    sk_user_sender: &[u8],
+    pk_user_recipient: &[u8],
+    aad: &[u8],
+    message: &[u8],
+    packet_out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+
+    let result =
+        mlsigcrypt_v1::signcrypt_into(sk_user_sender, pk_user_recipient, aad, message, packet_out)
+            .map_err(|_| {
+                zeroize_slice(packet_out);
+                "mlsigcrypt-v1 signcrypt failed"
+            });
+
+    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_V1_SIGNCRYPT_NS);
+    result
+}
+
+/// MLSigcrypt-v1 open with unified failure semantics.
+pub fn mlsigcrypt_v1_unsigncrypt(
+    sk_user_recipient: &[u8],
+    pk_user_sender: &[u8],
+    aad: &[u8],
+    packet: &[u8],
+    plaintext_out: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let start = Instant::now();
+
+    let result = mlsigcrypt_v1::unsigncrypt_into(
+        sk_user_recipient,
+        pk_user_sender,
+        aad,
+        packet,
+        plaintext_out,
+    )
+    .map_err(|_| {
+        zeroize_slice(plaintext_out);
+        "mlsigcrypt-v1 open failed"
+    });
+
+    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_V1_UNSIGNCRYPT_NS);
+    result
+}
+
 /// SHA-512 digest.
 pub fn hash(data: &[u8]) -> [u8; 64] {
     let start = Instant::now();
-    let digest = crate::algos::sha512::hash(data);
+    let digest = crate::mlsigcrypt::specs::sha512::hash(data);
     enforce_public_floor(start, FLOOR_PUBLIC_HASH_NS);
     digest
 }
@@ -643,5 +723,76 @@ mod tests {
         assert!(sign(&sk, msg, &mut sig).is_ok());
 
         assert!(verify(&pk, msg, &sig));
+    }
+
+    #[test]
+    fn mlsigcrypt_v1_public_api_roundtrip() {
+        let aad = b"bastion-mlsigcrypt-v1";
+        let msg = b"mlsigcrypt-v1 public api roundtrip";
+        let mut sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+        let mut sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+        let mut recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+        let mut recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+        let mut packet = [0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + 96];
+        let mut plaintext = [0u8; 96];
+
+        assert!(mlsigcrypt_v1_keygen(&mut sender_pk, &mut sender_sk).is_ok());
+        assert!(mlsigcrypt_v1_keygen(&mut recipient_pk, &mut recipient_sk).is_ok());
+
+        let packet_len = mlsigcrypt_v1_signcrypt(&sender_sk, &recipient_pk, aad, msg, &mut packet)
+            .expect("signcrypt succeeds");
+        let plain_len = mlsigcrypt_v1_unsigncrypt(
+            &recipient_sk,
+            &sender_pk,
+            aad,
+            &packet[..packet_len],
+            &mut plaintext,
+        )
+        .expect("unsigncrypt succeeds");
+
+        assert_eq!(&plaintext[..plain_len], msg);
+    }
+
+    #[test]
+    fn mlsigcrypt_v1_open_failures_are_unified() {
+        let aad = b"bastion-mlsigcrypt-v1";
+        let msg = b"fail-open";
+        let mut sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+        let mut sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+        let mut recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+        let mut recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+        let mut packet = [0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + 64];
+        let mut plaintext = [0u8; 64];
+
+        assert!(mlsigcrypt_v1_keygen(&mut sender_pk, &mut sender_sk).is_ok());
+        assert!(mlsigcrypt_v1_keygen(&mut recipient_pk, &mut recipient_sk).is_ok());
+
+        let packet_len = mlsigcrypt_v1_signcrypt(&sender_sk, &recipient_pk, aad, msg, &mut packet)
+            .expect("signcrypt succeeds");
+
+        let mut tampered = [0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + 64];
+        tampered[..packet_len].copy_from_slice(&packet[..packet_len]);
+        tampered[mlsigcrypt_v1::PACKET_OVERHEAD - DSA_SIGNATURE_SIZE - TAG_SIZE - 1] ^= 0x01;
+
+        assert_eq!(
+            mlsigcrypt_v1_unsigncrypt(
+                &recipient_sk,
+                &sender_pk,
+                aad,
+                &tampered[..packet_len],
+                &mut plaintext,
+            ),
+            Err("mlsigcrypt-v1 open failed")
+        );
+        assert_eq!(
+            mlsigcrypt_v1_unsigncrypt(
+                &recipient_sk,
+                &sender_pk,
+                b"wrong-aad",
+                &packet[..packet_len],
+                &mut plaintext,
+            ),
+            Err("mlsigcrypt-v1 open failed")
+        );
     }
 }

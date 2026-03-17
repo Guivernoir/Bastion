@@ -74,7 +74,7 @@ jobs:
       - name: Public API contract
         run: |
           set -euo pipefail
-          expected=(compare cut decapsulate decrypt dsa_keygen encapsulate encrypt hash kem_keygen layer_decrypt layer_encrypt onion sign verify)
+          expected=(compare cut decapsulate decrypt dsa_keygen encapsulate encrypt hash kem_keygen layer_decrypt layer_encrypt mlsigcrypt_v1_keygen mlsigcrypt_v1_signcrypt mlsigcrypt_v1_unsigncrypt onion sign verify)
           mapfile -t actual < <(grep -nE '^pub fn ' src/lib.rs | sed -E 's/.*pub fn ([A-Za-z0-9_]+).*/\1/' | sort)
           printf '%s\n' "${actual[@]}" > /tmp/actual_api.txt
           printf '%s\n' "${expected[@]}" | sort > /tmp/expected_api.txt
@@ -91,8 +91,29 @@ jobs:
             exit 1
           fi
 
+      - name: Internal clone/copy policy
+        run: |
+          set -euo pipefail
+          copy_hits="$(grep -REH '#\[derive\([^]]*Copy|impl[[:space:]]+Copy[[:space:]]+for' src/mlsigcrypt src/pqc.rs src/constant_time.rs src/zeroize.rs || true)"
+          if [ -n "$copy_hits" ]; then
+            echo 'Copy is forbidden in internal crypto modules.'
+            printf '%s\n' "$copy_hits"
+            exit 1
+          fi
+
+          allowed_clone='src/mlsigcrypt/keys.rs:#[derive(Clone)]'
+          clone_hits="$(grep -REH '#\[derive\([^]]*Clone|impl[[:space:]]+Clone[[:space:]]+for' src/mlsigcrypt src/pqc.rs src/constant_time.rs src/zeroize.rs || true)"
+          if [ -n "$clone_hits" ] && [ "$clone_hits" != "$allowed_clone" ]; then
+            echo 'Unexpected Clone usage in internal crypto modules:'
+            printf '%s\n' "$clone_hits"
+            exit 1
+          fi
+
       - name: Benchmark compile smoke
         run: cargo bench --locked --bench public_api --no-run
+
+      - name: Run public API demo
+        run: cargo run --locked --example public_api_demo
 
       - name: Generate hardening report
         run: cargo run --locked --example write_results
@@ -108,8 +129,12 @@ jobs:
           fi
 
           for section in \
-            '[kem_keygen]' '[dsa_keygen]' '[decrypt/1k]' '[decapsulate]' '[verify/256b]' '[layer_decrypt/3]' '[cut/2]' \
-            '[ct/decrypt]' '[ct/decapsulate]' '[ct/verify]' '[ct/layer_decrypt]' '[ct/cut]'
+            '[kem_keygen]' '[dsa_keygen]' '[decrypt/1k]' '[decapsulate]' '[verify/256b]' \
+            '[mlsigcrypt_v1_keygen]' '[mlsigcrypt_v1_signcrypt/256b]' '[mlsigcrypt_v1_unsigncrypt/256b]' \
+            '[layer_decrypt/3]' '[cut/2]' \
+            '[ct/decrypt]' '[ct/decapsulate]' '[ct/verify]' \
+            '[ct/mlsigcrypt_v1_signcrypt]' '[ct/mlsigcrypt_v1_unsigncrypt]' \
+            '[ct/layer_decrypt]' '[ct/cut]'
           do
             grep -Fq "$section" results.txt
           done
@@ -163,6 +188,7 @@ jobs:
           cargo +nightly fuzz build fuzz_encrypt_api
           cargo +nightly fuzz build fuzz_encaps_sign_api
           cargo +nightly fuzz build fuzz_onion_api
+          cargo +nightly fuzz build fuzz_mlsigcrypt_v1_api
 
       - name: Run fuzz smoke
         run: |
@@ -171,6 +197,7 @@ jobs:
           cargo +nightly fuzz run fuzz_encrypt_api -- -runs=300 -max_total_time=15
           cargo +nightly fuzz run fuzz_encaps_sign_api -- -runs=300 -max_total_time=15
           cargo +nightly fuzz run fuzz_onion_api -- -runs=300 -max_total_time=15
+          cargo +nightly fuzz run fuzz_mlsigcrypt_v1_api -- -runs=300 -max_total_time=15
 
   release:
     name: Release (Tag)

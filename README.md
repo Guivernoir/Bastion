@@ -14,6 +14,10 @@ Bastion is a hardened cryptographic crate focused on strict operational constrai
 
 Only these crate-level functions are public:
 
+- `mlsigcrypt_v1_keygen`
+- `mlsigcrypt_v1_signcrypt`
+- `mlsigcrypt_v1_unsigncrypt`
+- legacy primitive surface:
 - `encrypt`
 - `decrypt`
 - `kem_keygen`
@@ -37,6 +41,9 @@ The crate also exposes public size constants for buffer sizing:
 - `DSA_PUBLIC_KEY_SIZE`
 - `DSA_SECRET_KEY_SIZE`
 - `DSA_SIGNATURE_SIZE`
+- `MLSIGCRYPT_V1_PUBLIC_KEY_SIZE`
+- `MLSIGCRYPT_V1_SECRET_KEY_SIZE`
+- `MLSIGCRYPT_V1_PACKET_OVERHEAD`
 - `NONCE_SIZE`
 - `TAG_SIZE`
 - `LAYER_OVERHEAD`
@@ -91,6 +98,27 @@ pub fn sign(
 ) -> Result<(), &'static str>;
 
 pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool;
+
+pub fn mlsigcrypt_v1_keygen(
+    pk_user_out: &mut [u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE],
+    sk_user_out: &mut [u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE],
+) -> Result<(), &'static str>;
+
+pub fn mlsigcrypt_v1_signcrypt(
+    sk_user_sender: &[u8],
+    pk_user_recipient: &[u8],
+    aad: &[u8],
+    message: &[u8],
+    packet_out: &mut [u8],
+) -> Result<usize, &'static str>;
+
+pub fn mlsigcrypt_v1_unsigncrypt(
+    sk_user_recipient: &[u8],
+    pk_user_sender: &[u8],
+    aad: &[u8],
+    packet: &[u8],
+    plaintext_out: &mut [u8],
+) -> Result<usize, &'static str>;
 
 pub fn hash(data: &[u8]) -> [u8; 64];
 pub fn compare(a: &[u8], b: &[u8]) -> bool;
@@ -195,6 +223,42 @@ assert!(verify(&pk, msg, &sig));
 # Ok::<(), &'static str>(())
 ```
 
+### MLSigcrypt-v1 Unified Signcryption
+
+`MLSIGCRYPT_V1_PACKET_OVERHEAD` is the fixed packet cost excluding the payload ciphertext.
+
+```rust
+use crypto_bastion::{
+    MLSIGCRYPT_V1_PACKET_OVERHEAD, MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, MLSIGCRYPT_V1_SECRET_KEY_SIZE,
+    mlsigcrypt_v1_keygen, mlsigcrypt_v1_signcrypt, mlsigcrypt_v1_unsigncrypt,
+};
+
+let aad = b"context";
+let msg = b"signcrypted";
+
+let mut sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+let mut sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+let mut recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+let mut recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+let mut packet = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + msg.len()];
+let mut plaintext = vec![0u8; msg.len()];
+
+mlsigcrypt_v1_keygen(&mut sender_pk, &mut sender_sk)?;
+mlsigcrypt_v1_keygen(&mut recipient_pk, &mut recipient_sk)?;
+let packet_len =
+    mlsigcrypt_v1_signcrypt(&sender_sk, &recipient_pk, aad, msg, &mut packet)?;
+let plain_len = mlsigcrypt_v1_unsigncrypt(
+    &recipient_sk,
+    &sender_pk,
+    aad,
+    &packet[..packet_len],
+    &mut plaintext,
+)?;
+
+assert_eq!(&plaintext[..plain_len], msg);
+# Ok::<(), &'static str>(())
+```
+
 ### Layered Onion Encryption
 
 Per-layer overhead is `LAYER_OVERHEAD` bytes. Required output size is:
@@ -267,9 +331,8 @@ cargo +nightly fuzz run fuzz_onion_api -- -max_total_time=30
 ## Repository Layout
 
 - `src/lib.rs` public API and hybrid orchestration
-- `src/algos/aes256gcm/` AES-GCM internals
-- `src/algos/mlkem1024/` ML-KEM internals
-- `src/algos/mldsa87/` ML-DSA internals
+- `src/mlsigcrypt/` MLSigcrypt-v1 protocol orchestration and internal packet logic
+- `src/mlsigcrypt/specs/` primitive implementations: SHA3-512, HKDF, SHA-512, AES-GCM, ML-KEM, ML-DSA
 - `src/constant_time.rs` constant-time helpers and timing guard
 - `src/zeroize.rs` zeroization primitives
 - `examples/` usage and reporting tools

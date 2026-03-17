@@ -40,3 +40,10 @@ path = "fuzz_targets/fuzz_onion_api.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_mlsigcrypt_v1_api"
+path = "fuzz_targets/fuzz_mlsigcrypt_v1_api.rs"
+test = false
+doc = false
+bench = false

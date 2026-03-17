@@ -3,9 +3,10 @@
 
 use crypto_bastion::{
     DSA_PUBLIC_KEY_SIZE, DSA_SECRET_KEY_SIZE, DSA_SIGNATURE_SIZE, KEM_CIPHERTEXT_SIZE,
-    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, compare, cut, decapsulate, decrypt,
-    dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt, onion, sign,
-    verify,
+    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, MLSIGCRYPT_V1_PACKET_OVERHEAD,
+    MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, MLSIGCRYPT_V1_SECRET_KEY_SIZE, compare, cut, decapsulate,
+    decrypt, dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt,
+    mlsigcrypt_v1_keygen, mlsigcrypt_v1_signcrypt, mlsigcrypt_v1_unsigncrypt, onion, sign, verify,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -348,6 +349,38 @@ fn main() -> std::io::Result<()> {
     let _ = encapsulate(&kem_pk, &mut kem_ct_in, &mut kem_ss_out);
     let _ = sign(&dsa_sk, &sign_msg, &mut dsa_sig_out);
 
+    let mlsigcrypt_aad = vec![0x5Cu8; 48];
+    let mlsigcrypt_msg = vec![0xC3u8; 256];
+    let mlsigcrypt_msg_alt = vec![0x3Cu8; 256];
+    let mut mlsigcrypt_sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut mlsigcrypt_sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut mlsigcrypt_recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut mlsigcrypt_recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut mlsigcrypt_keygen_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut mlsigcrypt_keygen_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let _ = mlsigcrypt_v1_keygen(&mut mlsigcrypt_sender_pk, &mut mlsigcrypt_sender_sk);
+    let _ = mlsigcrypt_v1_keygen(&mut mlsigcrypt_recipient_pk, &mut mlsigcrypt_recipient_sk);
+    let mut mlsigcrypt_packet = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + mlsigcrypt_msg.len()];
+    let mut mlsigcrypt_opened = vec![0u8; mlsigcrypt_msg.len()];
+    let mlsigcrypt_packet_len = mlsigcrypt_v1_signcrypt(
+        &mlsigcrypt_sender_sk,
+        &mlsigcrypt_recipient_pk,
+        &mlsigcrypt_aad,
+        &mlsigcrypt_msg,
+        &mut mlsigcrypt_packet,
+    )
+    .unwrap_or(0);
+    let mut mlsigcrypt_packet_alt =
+        vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + mlsigcrypt_msg_alt.len()];
+    let mlsigcrypt_packet_alt_len = mlsigcrypt_v1_signcrypt(
+        &mlsigcrypt_sender_sk,
+        &mlsigcrypt_recipient_pk,
+        &mlsigcrypt_aad,
+        &mlsigcrypt_msg_alt,
+        &mut mlsigcrypt_packet_alt,
+    )
+    .unwrap_or(0);
+
     let mut kem0 = [0u8; KEM_PUBLIC_KEY_SIZE];
     let mut kem1 = [0u8; KEM_PUBLIC_KEY_SIZE];
     let mut kem2 = [0u8; KEM_PUBLIC_KEY_SIZE];
@@ -471,6 +504,33 @@ fn main() -> std::io::Result<()> {
             );
             let _ = black_box(out);
         }),
+        measure("mlsigcrypt_v1_keygen", 30, || {
+            let out = mlsigcrypt_v1_keygen(
+                black_box(&mut mlsigcrypt_keygen_pk),
+                black_box(&mut mlsigcrypt_keygen_sk),
+            );
+            let _ = black_box(out);
+        }),
+        measure("mlsigcrypt_v1_signcrypt/256b", 80, || {
+            let out = mlsigcrypt_v1_signcrypt(
+                black_box(&mlsigcrypt_sender_sk),
+                black_box(&mlsigcrypt_recipient_pk),
+                black_box(&mlsigcrypt_aad),
+                black_box(&mlsigcrypt_msg),
+                black_box(&mut mlsigcrypt_packet),
+            );
+            let _ = black_box(out);
+        }),
+        measure("mlsigcrypt_v1_unsigncrypt/256b", 80, || {
+            let out = mlsigcrypt_v1_unsigncrypt(
+                black_box(&mlsigcrypt_recipient_sk),
+                black_box(&mlsigcrypt_sender_pk),
+                black_box(&mlsigcrypt_aad),
+                black_box(&mlsigcrypt_packet[..mlsigcrypt_packet_len]),
+                black_box(&mut mlsigcrypt_opened),
+            );
+            let _ = black_box(out);
+        }),
         measure("layer_encrypt/3", 40, || {
             let out = layer_encrypt(
                 black_box(&layer_plaintext),
@@ -552,6 +612,10 @@ fn main() -> std::io::Result<()> {
     let _ = sign(&dsa_sk_alt, &sign_msg_alt, &mut ct_sig_b);
     let _ = encapsulate(&kem_pk, &mut ct_kem_ct_in_a, &mut ct_kem_ss_tmp);
     let _ = encapsulate(&kem_pk, &mut ct_kem_ct_in_b, &mut ct_kem_ss_tmp);
+    let mut ct_mls_packet_a = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + mlsigcrypt_msg.len()];
+    let mut ct_mls_packet_b = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + mlsigcrypt_msg_alt.len()];
+    let mut ct_mls_open_a = vec![0u8; mlsigcrypt_msg.len()];
+    let mut ct_mls_open_b = vec![0u8; mlsigcrypt_msg_alt.len()];
     let mut ct_layer_a = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
     let mut ct_layer_b = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
     let mut ct_layer_decrypt_a = vec![0u8; layer_plaintext.len() + (3 * LAYER_OVERHEAD)];
@@ -725,6 +789,56 @@ fn main() -> std::io::Result<()> {
                 ));
             },
             1_300_000,
+        ),
+        ct_check(
+            "mlsigcrypt_v1_signcrypt",
+            60,
+            "msg_c3",
+            || {
+                let _ = black_box(mlsigcrypt_v1_signcrypt(
+                    black_box(&mlsigcrypt_sender_sk),
+                    black_box(&mlsigcrypt_recipient_pk),
+                    black_box(&mlsigcrypt_aad),
+                    black_box(&mlsigcrypt_msg),
+                    black_box(&mut ct_mls_packet_a),
+                ));
+            },
+            "msg_3c",
+            || {
+                let _ = black_box(mlsigcrypt_v1_signcrypt(
+                    black_box(&mlsigcrypt_sender_sk),
+                    black_box(&mlsigcrypt_recipient_pk),
+                    black_box(&mlsigcrypt_aad),
+                    black_box(&mlsigcrypt_msg_alt),
+                    black_box(&mut ct_mls_packet_b),
+                ));
+            },
+            1_400_000,
+        ),
+        ct_check(
+            "mlsigcrypt_v1_unsigncrypt",
+            60,
+            "pkt_c3",
+            || {
+                let _ = black_box(mlsigcrypt_v1_unsigncrypt(
+                    black_box(&mlsigcrypt_recipient_sk),
+                    black_box(&mlsigcrypt_sender_pk),
+                    black_box(&mlsigcrypt_aad),
+                    black_box(&mlsigcrypt_packet[..mlsigcrypt_packet_len]),
+                    black_box(&mut ct_mls_open_a),
+                ));
+            },
+            "pkt_3c",
+            || {
+                let _ = black_box(mlsigcrypt_v1_unsigncrypt(
+                    black_box(&mlsigcrypt_recipient_sk),
+                    black_box(&mlsigcrypt_sender_pk),
+                    black_box(&mlsigcrypt_aad),
+                    black_box(&mlsigcrypt_packet_alt[..mlsigcrypt_packet_alt_len]),
+                    black_box(&mut ct_mls_open_b),
+                ));
+            },
+            1_400_000,
         ),
         ct_check(
             "layer_encrypt",

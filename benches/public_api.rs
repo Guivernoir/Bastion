@@ -3,14 +3,16 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use crypto_bastion::{
     DSA_PUBLIC_KEY_SIZE, DSA_SECRET_KEY_SIZE, DSA_SIGNATURE_SIZE, KEM_CIPHERTEXT_SIZE,
-    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, compare, cut, decapsulate, decrypt,
-    dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt, onion, sign,
-    verify,
+    KEM_PUBLIC_KEY_SIZE, KEM_SECRET_KEY_SIZE, LAYER_OVERHEAD, MLSIGCRYPT_V1_PACKET_OVERHEAD,
+    MLSIGCRYPT_V1_PUBLIC_KEY_SIZE, MLSIGCRYPT_V1_SECRET_KEY_SIZE, compare, cut, decapsulate,
+    decrypt, dsa_keygen, encapsulate, encrypt, hash, kem_keygen, layer_decrypt, layer_encrypt,
+    mlsigcrypt_v1_keygen, mlsigcrypt_v1_signcrypt, mlsigcrypt_v1_unsigncrypt, onion, sign, verify,
 };
 
 const PLAINTEXT_1K: usize = 1024;
 const SIGN_MSG_256: usize = 256;
 const LAYER_PT_128: usize = 128;
+const MLSIGCRYPT_MSG_256: usize = 256;
 
 fn bench_hash_compare(c: &mut Criterion) {
     let data = [0xA5u8; 4096];
@@ -236,11 +238,64 @@ fn bench_layered(c: &mut Criterion) {
     });
 }
 
+fn bench_mlsigcrypt(c: &mut Criterion) {
+    let aad = [0xA6u8; 32];
+    let msg = [0xD4u8; MLSIGCRYPT_MSG_256];
+
+    let mut sender_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut sender_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut recipient_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut recipient_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut keygen_pk = [0u8; MLSIGCRYPT_V1_PUBLIC_KEY_SIZE];
+    let mut keygen_sk = [0u8; MLSIGCRYPT_V1_SECRET_KEY_SIZE];
+    let mut packet = vec![0u8; MLSIGCRYPT_V1_PACKET_OVERHEAD + msg.len()];
+    let mut opened = vec![0u8; msg.len()];
+
+    let _ = mlsigcrypt_v1_keygen(&mut sender_pk, &mut sender_sk);
+    let _ = mlsigcrypt_v1_keygen(&mut recipient_pk, &mut recipient_sk);
+    let packet_len =
+        mlsigcrypt_v1_signcrypt(&sender_sk, &recipient_pk, &aad, &msg, &mut packet).unwrap_or(0);
+
+    c.bench_function("api/mlsigcrypt_v1_keygen", |b| {
+        b.iter(|| {
+            let out = mlsigcrypt_v1_keygen(black_box(&mut keygen_pk), black_box(&mut keygen_sk));
+            let _ = black_box(out);
+        })
+    });
+
+    c.bench_function("api/mlsigcrypt_v1_signcrypt/256b", |b| {
+        b.iter(|| {
+            let out = mlsigcrypt_v1_signcrypt(
+                black_box(&sender_sk),
+                black_box(&recipient_pk),
+                black_box(&aad),
+                black_box(&msg),
+                black_box(&mut packet),
+            );
+            let _ = black_box(out);
+        })
+    });
+
+    c.bench_function("api/mlsigcrypt_v1_unsigncrypt/256b", |b| {
+        b.iter(|| {
+            let out = mlsigcrypt_v1_unsigncrypt(
+                black_box(&recipient_sk),
+                black_box(&sender_pk),
+                black_box(&aad),
+                black_box(&packet[..packet_len]),
+                black_box(&mut opened),
+            );
+            let _ = black_box(out);
+        })
+    });
+}
+
 fn all_benches(c: &mut Criterion) {
     bench_hash_compare(c);
     bench_symmetric(c);
     bench_pqc(c);
     bench_layered(c);
+    bench_mlsigcrypt(c);
 }
 
 criterion_group!(benches, all_benches);
