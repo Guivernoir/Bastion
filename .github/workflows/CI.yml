@@ -135,7 +135,8 @@ jobs:
             grep -Fq "$section" results.txt
           done
 
-          # Timing on shared CI runners is noisy. Gate only catastrophic spread.
+          # examples/write_results.rs uses a stricter 1.4x reporting threshold.
+          # Shared CI runners are noisier, so this gate only rejects catastrophic spread.
           max_ratio_ppm=3000000
           while IFS= read -r ratio; do
             if [ "$ratio" -gt "$max_ratio_ppm" ]; then

@@ -43,7 +43,7 @@ pub(crate) mod specs;
 
 use crate::error::{CryptoError, Result};
 use crate::os_random::fill_os_random_array;
-use crate::zeroize::{zeroize_array, zeroize_slice};
+use crate::zeroize::zeroize_array;
 
 use self::keys::{decode_public_key, decode_secret_key, keygen};
 
@@ -80,7 +80,7 @@ pub(crate) fn signcrypt_into(
         CryptoError::invalid_public_key("invalid MLSigcrypt-v2 public key length")
     })?;
 
-    let result = signcrypt::signcrypt(
+    signcrypt::signcrypt(
         &sender_sk,
         &sender_pk,
         &recipient_pk,
@@ -88,11 +88,7 @@ pub(crate) fn signcrypt_into(
         message,
         packet_out,
     )
-    .map_err(|_| CryptoError::encryption_failed("MLSigcrypt-v2 signcrypt failed"));
-    if result.is_err() {
-        zeroize_slice(packet_out);
-    }
-    result
+    .map_err(|_| CryptoError::encryption_failed("MLSigcrypt-v2 signcrypt failed"))
 }
 
 pub(crate) fn unsigncrypt_into(
@@ -108,7 +104,7 @@ pub(crate) fn unsigncrypt_into(
         CryptoError::invalid_public_key("invalid MLSigcrypt-v2 public key length")
     })?;
 
-    let result = signcrypt::unsigncrypt(
+    signcrypt::unsigncrypt(
         &recipient_sk,
         &sender_pk,
         &recipient_pk,
@@ -116,11 +112,7 @@ pub(crate) fn unsigncrypt_into(
         packet,
         plaintext_out,
     )
-    .map_err(|_| CryptoError::decryption_failed("MLSigcrypt-v2 open failed"));
-    if result.is_err() {
-        zeroize_slice(plaintext_out);
-    }
-    result
+    .map_err(|_| CryptoError::decryption_failed("MLSigcrypt-v2 open failed"))
 }
 
 #[cfg(test)]

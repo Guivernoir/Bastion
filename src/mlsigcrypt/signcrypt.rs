@@ -118,6 +118,7 @@ fn xor_keystream_in_place(
         for i in 0..take {
             buf[offset + i] ^= block[i];
         }
+        zeroize_slice(&mut block[..take]);
         offset += take;
     }
 
@@ -172,6 +173,7 @@ pub(crate) fn signcrypt(
 
     let mut kappa = Secret::<{ KEM_SS_LEN }>::new();
     kappa.0.copy_from_slice(ss.as_bytes());
+    drop(ss);
     xor_keystream_in_place(
         &kappa.0,
         pk_user_s.key_id(),
@@ -273,6 +275,9 @@ fn unsigncrypt_inner(
         return Err(SigncryptOpenFailed);
     }
 
+    // verify_consistency() above guarantees both public-key objects carry
+    // canonical key_id values derived from their public components, so these
+    // packet checks compare against verified identity material.
     if !ct_eq(
         &packet[PKT_KEY_ID_S_OFF..PKT_KEY_ID_S_OFF + KEY_ID_LEN],
         pk_user_s.key_id(),
@@ -337,6 +342,7 @@ fn unsigncrypt_inner(
 
     let mut kappa = Secret::<{ KEM_SS_LEN }>::new();
     kappa.0.copy_from_slice(ss.as_bytes());
+    drop(ss);
 
     out[..ct_len].copy_from_slice(ct);
     xor_keystream_in_place(&kappa.0, key_id_s, key_id_r, kem_ct, &mut out[..ct_len]);
@@ -414,6 +420,18 @@ mod tests {
     }
 
     #[test]
+    fn tampered_kem_ct_rejected() {
+        let (sk_s, pk_s) = make_keypair(0x45);
+        let (sk_r, pk_r) = make_keypair(0x46);
+        let msg = b"kem ct tamper";
+        let mut pkt = vec![0u8; msg.len() + PACKET_FIXED_OVERHEAD];
+        let pkt_len = signcrypt(&sk_s, &pk_s, &pk_r, b"", msg, &mut pkt).unwrap();
+        pkt[PKT_KEM_CT_OFF + 42] ^= 0x80;
+        let mut out = vec![0u8; msg.len()];
+        assert!(unsigncrypt(&sk_r, &pk_s, &pk_r, b"", &pkt[..pkt_len], &mut out).is_err());
+    }
+
+    #[test]
     fn tampered_signature_rejected() {
         let (sk_s, pk_s) = make_keypair(0x50);
         let (sk_r, pk_r) = make_keypair(0x51);
@@ -455,6 +473,30 @@ mod tests {
         let pkt_len = signcrypt(&sk_s, &pk_s, &pk_r, b"", msg, &mut pkt).unwrap();
         let mut out = vec![0u8; msg.len()];
         assert!(unsigncrypt(&sk_r, &wrong_pk_s, &pk_r, b"", &pkt[..pkt_len], &mut out).is_err());
+    }
+
+    #[test]
+    fn tampered_key_id_s_rejected() {
+        let (sk_s, pk_s) = make_keypair(0x88);
+        let (sk_r, pk_r) = make_keypair(0x89);
+        let msg = b"sender key id tamper";
+        let mut pkt = vec![0u8; msg.len() + PACKET_FIXED_OVERHEAD];
+        let pkt_len = signcrypt(&sk_s, &pk_s, &pk_r, b"", msg, &mut pkt).unwrap();
+        pkt[PKT_KEY_ID_S_OFF] ^= 0x01;
+        let mut out = vec![0u8; msg.len()];
+        assert!(unsigncrypt(&sk_r, &pk_s, &pk_r, b"", &pkt[..pkt_len], &mut out).is_err());
+    }
+
+    #[test]
+    fn tampered_key_id_r_rejected() {
+        let (sk_s, pk_s) = make_keypair(0x8A);
+        let (sk_r, pk_r) = make_keypair(0x8B);
+        let msg = b"recipient key id tamper";
+        let mut pkt = vec![0u8; msg.len() + PACKET_FIXED_OVERHEAD];
+        let pkt_len = signcrypt(&sk_s, &pk_s, &pk_r, b"", msg, &mut pkt).unwrap();
+        pkt[PKT_KEY_ID_R_OFF] ^= 0x01;
+        let mut out = vec![0u8; msg.len()];
+        assert!(unsigncrypt(&sk_r, &pk_s, &pk_r, b"", &pkt[..pkt_len], &mut out).is_err());
     }
 
     #[test]

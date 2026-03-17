@@ -51,7 +51,7 @@ pub fn mlsigcrypt_unsigncrypt(
 
 ```toml
 [dependencies]
-crypto_bastion = "0.7"
+crypto_bastion = "0.6.1"
 ```
 
 ## Quick Start
