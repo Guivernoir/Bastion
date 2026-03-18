@@ -289,6 +289,66 @@ pub(crate) fn keygen(msk: &[u8; MASTER_SECRET_LEN]) -> (UserSecretKey, UserPubli
 }
 
 #[cfg(test)]
+pub(crate) struct KeygenTrace {
+    pub(crate) msk: [u8; MASTER_SECRET_LEN],
+    pub(crate) matrix_seed: [u8; MATRIX_SEED_LEN],
+    pub(crate) rho_shared: [u8; MATRIX_SEED_LEN],
+    pub(crate) sk_enc_seed: [u8; SK_ENC_SEED_LEN],
+    pub(crate) sig_seed: [u8; 32],
+    pub(crate) key_id: [u8; KEY_ID_LEN],
+    pub(crate) pk_enc: [u8; ENC_PK_LEN],
+    pub(crate) pk_sig: [u8; SIG_PK_LEN],
+    pub(crate) encoded_public_key: [u8; ENCODED_PUBLIC_KEY_SIZE],
+    pub(crate) encoded_secret_key: [u8; ENCODED_SECRET_KEY_SIZE],
+}
+
+#[cfg(test)]
+pub(crate) fn keygen_trace(msk: &[u8; MASTER_SECRET_LEN]) -> KeygenTrace {
+    let (secret_key, public_key) = keygen(msk);
+    let mut encoded_public_key = [0u8; ENCODED_PUBLIC_KEY_SIZE];
+    let mut encoded_secret_key = [0u8; ENCODED_SECRET_KEY_SIZE];
+    let mut matrix_seed_full = [0u8; SHA3_512_OUT];
+    let mut sk_enc_seed_full = [0u8; SHA3_512_OUT];
+    let mut sig_seed_full = [0u8; SHA3_512_OUT];
+    let mut matrix_seed = [0u8; MATRIX_SEED_LEN];
+    let mut rho_shared = [0u8; MATRIX_SEED_LEN];
+    let mut sk_enc_seed = [0u8; SK_ENC_SEED_LEN];
+    let mut sig_seed = [0u8; 32];
+
+    sha3_512(&[MATRIX_SEED_DOMAIN, msk], &mut matrix_seed_full);
+    matrix_seed.copy_from_slice(&matrix_seed_full[..MATRIX_SEED_LEN]);
+    derive_matrix_rho(&matrix_seed, &mut rho_shared);
+
+    sha3_512(&[KEM_SEED_DOMAIN, msk], &mut sk_enc_seed_full);
+    sk_enc_seed.copy_from_slice(&sk_enc_seed_full[..SK_ENC_SEED_LEN]);
+
+    sha3_512(&[SIG_SEED_DOMAIN, msk], &mut sig_seed_full);
+    sig_seed.copy_from_slice(&sig_seed_full[..32]);
+
+    public_key.encode_into(&mut encoded_public_key);
+    secret_key.encode_into(&public_key, &mut encoded_secret_key);
+
+    unsafe {
+        zeroize_mem(matrix_seed_full.as_mut_ptr(), SHA3_512_OUT);
+        zeroize_mem(sk_enc_seed_full.as_mut_ptr(), SHA3_512_OUT);
+        zeroize_mem(sig_seed_full.as_mut_ptr(), SHA3_512_OUT);
+    }
+
+    KeygenTrace {
+        msk: *msk,
+        matrix_seed,
+        rho_shared,
+        sk_enc_seed,
+        sig_seed,
+        key_id: public_key.key_id,
+        pk_enc: public_key.pk_enc,
+        pk_sig: public_key.pk_sig,
+        encoded_public_key,
+        encoded_secret_key,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

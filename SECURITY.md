@@ -1,181 +1,318 @@
-# Bastion Security Documentation
+# Security Documentation — Bastion / MLSigcrypt-v3
 
 Last updated: 2026-03-17
 
-## Scope
+---
 
-This document covers the current `crypto_bastion` crate in this repository.
+## Preamble
 
-Public cryptographic API:
+This document describes the security model, design controls, threat model,
+and known limitations of the MLSigcrypt-v3 scheme implemented in this crate.
 
-- `mlsigcrypt_keygen`
-- `mlsigcrypt_signcrypt`
-- `mlsigcrypt_unsigncrypt`
+It is written to be useful to someone evaluating whether this crate is
+appropriate for a particular deployment. It tries to be specific about what
+is known, what is unknown, and where informal reasoning ends and formal proof
+begins.
 
-Public sizing constants:
+**The headline conclusion**: the implementation is hardened and the construction
+is structurally sound, but the scheme does not yet have a formal security proof.
+Deployments that require provable security guarantees should not use Level 3
+until such a proof exists and has been independently reviewed.
 
-- `MLSIGCRYPT_PUBLIC_KEY_SIZE`
-- `MLSIGCRYPT_SECRET_KEY_SIZE`
-- `MLSIGCRYPT_PACKET_OVERHEAD`
-
-Everything else is internal (`pub(crate)`) and may change without public API
-guarantees.
+---
 
 ## Security Objectives
 
-- Preserve confidentiality, integrity, and sender authenticity for
-  MLSigcrypt-v3 packets.
-- Zeroize secret intermediates and defensive output buffers on failure paths.
-- Keep the public interface buffer-oriented and allocation-aware.
-- Minimize observable timing variance at the public wrapper boundary.
-- Keep failure behavior unified for packet open failures.
+The scheme aims to provide the following properties for a packet sent from
+sender S to recipient R:
+
+**Confidentiality**: A party that is not R cannot recover the plaintext, even
+given the ciphertext, the sender's public key, and any other packets between S
+and R.
+
+**Authenticity**: A party that is not S cannot produce a packet that R will
+accept as originating from S, even given S's public key and any other packets.
+
+**AAD binding**: The associated data `aad` is cryptographically bound to the
+packet. A packet produced with `aad = X` will not verify under any other value
+of `aad`.
+
+**Sender binding**: The sender's key identity is bound into the packet challenge.
+A packet produced by S for R cannot be re-attributed to a different sender S'
+without invalidating the challenge.
+
+**Recipient binding**: The recipient's encapsulation key is bound into the
+challenge. A packet produced for R cannot be decrypted by a different recipient
+R' without the challenge failing.
+
+**Unified failure**: All packet-open failures return the same error string with
+no detail. The implementation does not distinguish between wrong key, tampered
+ciphertext, tampered encap, wrong AAD, or malformed packet at the public API
+boundary.
+
+---
 
 ## Cryptographic Components
 
-- SHAKE-256 for the MLSigcrypt-v3 payload keystream and fused challenge derivation.
-- A custom noisy algebraic `u || v` encapsulation over the ML-DSA ring for packet confidentiality.
-- ML-DSA-87 response/hint machinery for outsider-verifiable authenticity.
-- SHA3-512 for key derivation, key identifiers, and AAD normalization.
+### Shared Lattice Matrix
 
-The MLSigcrypt-v3 packet path does not use AES-256-GCM, HKDF, or ML-KEM.
+A single 8×8 polynomial matrix `A` over `R_q = Z_q[X]/(X^256+1)`, `q = 8380417`,
+is generated per identity from the seed `ρ_shared = SHAKE-128(matrix_seed)`.
 
-## Compliance Note
+This matrix is used for both the signing component (ML-DSA rows 0..7 × columns 0..6)
+and the encapsulation component (4×4 top-left submatrix). The security assumption
+is that an adversary who sees `A` gains no structural advantage — this is consistent
+with how both ML-DSA and the algebraic encapsulation are defined, since `A` is
+public in both primitives independently.
 
-- MLSigcrypt-v3 level 3 uses a custom SHAKE-256 composition plus an algebraic
-  encapsulation field fused with the ML-DSA signing mask.
-- The crate uses standardized PQC primitives, but the overall packet
-  construction is not a FIPS 140-3 validated AEAD module.
-- Consumers that require only formally validated FIPS module compositions
-  should treat this crate as non-compliant for that requirement.
-- Level-3 keys and packets are intentionally not compatible with earlier
-  MLSigcrypt-v2 level-1 or level-2 profiles.
+### Algebraic Encapsulation
 
-## Design Controls
+The encapsulation is a Regev-style construction:
 
-### Restricted Public Surface
+```
+Key generation:
+  s_R, e_R ← small distributions (seed from sk_enc_seed)
+  t_R = A · s_R + e_R           (encapsulation public key)
 
-Only the three MLSigcrypt functions above are public cryptographic operations.
-No standalone encryption, hash, compare, onion-routing, or primitive-wrapper
-APIs are exposed.
+Encapsulation:
+  r, e₁, e₂ ← small distributions (seed from SHAKE256(ENCAP_MASK_DOMAIN ‖ packed_y))
+  u = Aᵀ · r + e₁
+  v = t_Rᵀ · r + e₂ + encode(mkey)
+  encap = u ‖ v
 
-### Output-Buffer APIs
+Decapsulation:
+  v - s_Rᵀ · u
+    = t_Rᵀ · r + e₂ + encode(mkey) - s_Rᵀ · (Aᵀ · r + e₁)
+    = (A · s_R + e_R)ᵀ · r + e₂ + encode(mkey) - s_Rᵀ · Aᵀ · r - s_Rᵀ · e₁
+    = s_Rᵀ · Aᵀ · r + e_Rᵀ · r + e₂ + encode(mkey) - s_Rᵀ · Aᵀ · r - s_Rᵀ · e₁
+    = e_Rᵀ · r + e₂ - s_Rᵀ · e₁ + encode(mkey)
+```
 
-Public methods use caller-provided output buffers for keys, packets, and
-plaintext recovery.
+The noise term `e_Rᵀ · r + e₂ - s_Rᵀ · e₁` is small (all vectors have small
+coefficients). The decapsulation threshold-decodes each coefficient: values close
+to 0 decode as bit 0, values close to q/2 decode as bit 1. The scheme is
+correct when the noise term does not push a coefficient across the decoding
+threshold.
 
-Benefits:
+The security of this construction against a passive adversary (IND-CPA) follows
+from the standard Module-LWE assumption under the distribution of `(A, t_R, u, v)`
+when `r, e₁, e₂` are freshly sampled. The full IND-CCA2 argument for the
+signcryption scheme additionally requires showing that the challenge binds the
+encapsulation to the signing component in a way that prevents adaptive attacks —
+this is part of the unwritten proof (see OPEN_PROBLEMS.md).
 
-- avoids implicit heap allocation in public hot paths
-- makes output sizes explicit and auditable
-- supports deterministic allocation measurement
+### Signing Component
+
+The signing component follows the ML-DSA-87 rejection-sampling structure
+(FIPS 204 Algorithm 2), with one modification: the challenge incorporates
+the encryption context.
+
+Standard ML-DSA computes `c̃ = H(µ ‖ w₁_packed)` where `µ = H(tr ‖ msg)`.
+MLSigcrypt-v3 computes:
+
+```
+c̃ = SHAKE256(DOMAIN_CHAL ‖ w₁_packed ‖ encap ‖ aad_digest
+             ‖ pk_sig_S ‖ pk_enc_R ‖ ct_len ‖ ct)
+```
+
+This construction binds the ciphertext and encapsulation into the signing
+transcript. The consequence is that the ciphertext cannot be replaced without
+invalidating `c̃`. It also means the sender implicitly signs the encryption
+— a packet signed by S for R under key `mkey` cannot be re-encrypted under
+a different `mkey` and remain valid.
+
+The deviation from the standard ML-DSA transcript (absorbing `pk_sig_S`
+directly rather than `H(pk_sig_S) = tr`) is intentional: it allows the
+challenge to bind the full verification key without a separate hash call.
+However, it means the standard EUF-CMA proof for ML-DSA does not transfer
+verbatim. The security argument requires a new reduction (see OPEN_PROBLEMS.md).
+
+### Keystream
+
+Payload encryption uses a SHAKE-256 duplex sponge:
+
+```
+S_E.absorb("MLSigcrypt-v3/enc\x03")
+S_E.absorb(mkey)
+S_E.absorb(key_id_S)
+S_E.absorb(key_id_R)
+S_E.absorb(encap)
+keystream = S_E.squeeze(len(plaintext))
+ciphertext = plaintext XOR keystream
+```
+
+The message key `mkey` is 32 bytes sampled from the OS. It is not derived from
+`y` or any signing intermediate. `encap` binds the keystream to the specific
+encapsulation used in this packet.
+
+### Hash and XOF Primitives
+
+All hash and XOF operations use a single internal Keccak-f[1600] implementation.
+Specific constructions:
+
+| Purpose | Construction |
+|---------|--------------|
+| Key derivation | SHA3-512 (rate 72 bytes, suffix 0x06) |
+| Matrix generation | SHAKE-128 (rate 168 bytes, suffix 0x1F) |
+| AAD normalisation | SHA3-512 with domain prefix |
+| Mask sampling | SHAKE-256 (rate 136 bytes, suffix 0x1F) |
+| Challenge derivation | SHAKE-256 |
+| Keystream | SHAKE-256 duplex |
+| Encap randomness | SHAKE-256 with domain prefix |
+
+Domain separation is enforced by distinct ASCII prefixes on every sponge
+invocation. No two protocol contexts share a prefix.
+
+---
+
+## Implementation Controls
 
 ### Zeroization
 
-Sensitive buffers and secret intermediates are explicitly wiped in keygen,
-signcrypt, and unsigncrypt flows.
+Sensitive material is explicitly overwritten using `core::ptr::write_volatile`
+followed by a `compiler_fence(SeqCst)`. This is intended to prevent the
+compiler from treating the writes as dead stores. The `#[inline(never)]`
+annotation on the core `zeroize_mem` function is mandatory — inlining would
+allow the surrounding optimisation context to re-examine observability and
+potentially eliminate the stores.
 
-Controls include:
+Material zeroed includes:
 
-- master-secret zeroization in key generation
-- zeroization of temporary `matrix_seed`-derived material during level-3 key generation
-- zeroize-on-drop wrappers for transcript, shared-secret copies, sponge output
-  blocks, and signing randomness
-- defensive wipe of public output buffers on public API failure
+- Master secret after key derivation.
+- `matrix_seed` and derived seeds after the matrix is generated.
+- `y`, `cs1`, `cs2`, `ct0`, `z`, `h` after the signing loop.
+- `mkey` and all sponge states after keystream generation.
+- `aad_digest` and `rho_prime` after use.
+- The plaintext output buffer if `unsigncrypt` fails.
 
-### Constant-Time and Ordering Controls
+The `Secret<N>` RAII wrapper in `signcrypt.rs` provides a fallback zeroize-on-drop
+for critical values that might be dropped early in an error path.
 
-- `ct_eq` is used for `alg_id`, `key_id_S`, and `key_id_R` packet checks.
-- Signature verification is completed before payload-key recovery.
-- Public wrappers apply timing-floor normalization to reduce interface-level
-  signal.
+**Limitation**: Zeroization by volatile write is a compiler-level defence, not
+a hardware-level guarantee. Cache lines, register spills, and CPU microarchitectural
+state may retain copies of sensitive material beyond the software wipe. This is
+a known limitation of software-only zeroization on commodity hardware. It is not
+addressed by this crate.
 
-These controls are practical hardening measures, not formal
-microarchitectural constant-time proofs.
+### Constant-Time Operations
+
+The following comparisons use `ct_eq`, which reads all bytes via `read_volatile`
+and accumulates differences without branching:
+
+- `alg_id` check in `unsigncrypt`.
+- `key_id_S` check in `unsigncrypt`.
+- `key_id_R` check in `unsigncrypt`.
+- `c_tilde` comparison in `verify_signature_challenge`.
+
+The ML-DSA signing loop contains a rejection branch whose execution time leaks
+the number of iterations. This is not a vulnerability in the context of this
+scheme — the iteration count has a geometric distribution independent of secret
+material — but it does mean the per-call timing of `signcrypt` is variable. The
+public API timing floor (7 ms) absorbs small iteration-count variance but is not
+a hard constant-time bound.
+
+**Limitation**: The `ct_eq` helper uses `read_volatile` and a `compiler_fence`
+to prevent compiler-level short-circuits. It does not constitute a formal
+constant-time proof against hardware side-channels (cache timing, power analysis,
+branch predictors). Side-channel analysis of a hardware implementation is not in
+scope for this document.
+
+### Timing Floors
+
+Public API wrappers spin-loop until a floor time has elapsed:
+
+| Operation      | Floor    |
+|----------------|----------|
+| Key generation | 0 ns     |
+| Signcrypt      | 7 000 000 ns (7 ms) |
+| Unsigncrypt    | 1 500 000 ns (1.5 ms) |
+
+Key generation has no floor because it has no adversary-controlled input at the
+public boundary. The signcrypt floor is set above the expected signing time to
+absorb typical iteration-count variance. The unsigncrypt floor is set above the
+expected verification time to reduce early-exit timing signals on invalid packets.
+
+These floors are heuristic. They are measured on a developer machine and may not
+hold on significantly faster or slower hardware. They should be tuned for the
+target deployment environment.
 
 ### Allocation and Dependency Policy
 
-- Runtime dependencies are restricted to the crate itself (`[dependencies]` is
-  empty).
-- Public cryptographic operations use caller-owned buffers instead of returning
-  heap-backed containers.
-- The current level-3 implementation uses an exact 23-bit encoding for the
-  recipient `u || v` encapsulation, so packet overhead is 8393 bytes rather
-  than the merge draft's rough compressed estimate.
-- `examples/write_results.rs` measures allocator activity, RSS deltas, and
-  timing spread for the public API.
+Runtime dependencies are empty. The crate has no `[dependencies]` entries. All
+operations use caller-provided output buffers. The public API does not allocate
+heap memory in hot paths.
 
-## Threat Model Summary
+This policy has two purposes: it keeps the supply-chain attack surface minimal,
+and it makes heap allocation measurable — the `write_results` example tracks
+allocator calls, and CI fails if any appear in the hot path.
 
-### Packet Tampering
+### Unified Failure Semantics
 
-- Signature verification binds sender/recipient identities, both public keys,
-  `encap`, normalized AAD, ciphertext length, and ciphertext bytes into the
-  fused challenge.
-- Modified packets fail with a unified open error.
+All packet-open failures produce a single error string: `"mlsigcrypt-v3 open failed"`.
+No internal state, failure cause, or field offset is disclosed. This prevents oracle
+attacks where an adversary infers partial information about a secret by observing
+which specific check failed.
 
-### Oracle Abuse / DoS
+---
 
-- Packet shape checks happen before expensive recovery work.
-- Payload-key recovery happens only after a valid signature check.
-- Public open failures collapse to a single outward error string.
+## Threat Model
 
-### Information Disclosure
+### In Scope
 
-- Secret material is zeroized after use.
-- Public wrappers do not expose detailed cryptographic failure causes.
+- An active network adversary who can observe, replay, modify, and inject packets.
+- An adversary who can adaptively query signcrypt and unsigncrypt on messages and
+  packets of their choice (CCA2 model), subject to the usual game restrictions.
+- A colluding adversary who obtains one party's secret key after the session
+  (forward secrecy is not claimed — keys are long-lived).
+- An adversary running a classical or quantum computer. The hardness assumptions
+  (Module-LWE and Module-SIS) are believed to be post-quantum secure under current
+  understanding.
 
-### Timing Analysis
+### Out of Scope
 
-- Required packet-identity comparisons use constant-time equality.
-- Public timing floors normalize the top-level wrapper behavior.
-- Timing spread is measured in `results.txt` and checked in CI.
+- **Key management**: the crate does not address key distribution, revocation,
+  or storage. Keys are raw byte buffers; protecting them is the caller's responsibility.
+- **Side-channel attacks on hardware**: power analysis, electromagnetic analysis,
+  fault injection, or cache-timing attacks at the microarchitectural level are not
+  addressed.
+- **Metadata leakage**: packet lengths reveal the plaintext length. Traffic
+  analysis is not addressed.
+- **Forward secrecy**: keys are long-lived. Compromising a secret key after the
+  fact allows decryption of all previously captured packets sent to that identity.
+- **Multi-user security with related keys**: if two identities share a master secret,
+  they share the same matrix `A`. The security of this configuration has not been
+  analysed.
+- **Denial of service via expensive operations**: the signing loop is bounded but
+  variable. An adversary who can trigger unsigncrypt on adversarially crafted packets
+  will always hit the cheap path (header checks fail early), but a malicious caller
+  who generates valid-looking packets with the intent of maximising signing iterations
+  is not specifically addressed.
 
-## Verification Workflow
+---
 
-Run in this order:
+## Compliance Note
 
-```bash
-cargo fmt --all -- --check
-cargo check --locked --all-targets
-cargo clippy --locked --all-targets -- \
-  -D clippy::correctness \
-  -A clippy::unwrap_used \
-  -A clippy::panic \
-  -A clippy::print_stdout \
-  -A clippy::print_stderr
-cargo test --locked --all-targets
-cargo test --locked nist --all-targets
-cargo test --locked fips --all-targets
-cargo test --locked sp800 --all-targets
-cargo doc --locked --no-deps
-cargo run --locked --example public_api_demo
-cargo run --locked --example write_results
-cargo bench --locked --bench public_api --no-run
-```
+MLSigcrypt-v3 reuses ML-DSA-87 parameter sets (FIPS 204) but the overall packet
+construction is not a validated FIPS 140-3 module. The custom SHAKE-256 AEAD
+construction and the algebraic encapsulation are not covered by any existing
+validation.
 
-Fuzzing (requires `cargo-fuzz` and nightly):
+Deployments that require FIPS 140-3 validated cryptography should use Level 1
+of the MLSigcrypt specification (ML-KEM-1024 + ML-DSA-87 + AES-256-GCM + HKDF),
+which composes validated primitives, or a separately validated implementation.
 
-```bash
-cd fuzz
-cargo +nightly fuzz run fuzz_mlsigcrypt_api -- -max_total_time=30
-```
-
-## Known Limitations
-
-- Timing-floor normalization is not a full side-channel proof.
-- Fuzzing is coverage-guided and time-bounded unless extended by the operator.
-- MLSigcrypt-v3 level 3 is not a FIPS 140-3 validated packet construction.
+---
 
 ## Disclosure Policy
 
-For security issues, report privately to the maintainers before public
-disclosure.
+Security issues should be reported privately to the maintainers before public
+disclosure. Coordinated disclosure is preferred.
 
-Recommended report content:
+Useful report content:
 
-- affected version or commit
-- reproducible steps or proof of concept
-- impact assessment
-- suggested remediation, if available
+- Affected version or commit hash.
+- A minimal reproducible example or proof of concept.
+- An assessment of impact and affected configurations.
+- A suggested remediation if available.
 
-Do not publish exploit details before coordinated remediation.
+Public exploit details should not be disclosed until a fix has been coordinated.

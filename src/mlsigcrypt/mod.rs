@@ -50,6 +50,9 @@ use crate::zeroize::zeroize_array;
 
 use self::keys::{decode_public_key, decode_secret_key, keygen};
 
+#[cfg(test)]
+mod kat;
+
 pub(crate) const PUBLIC_KEY_SIZE: usize = keys::ENCODED_PUBLIC_KEY_SIZE;
 pub(crate) const SECRET_KEY_SIZE: usize = keys::ENCODED_SECRET_KEY_SIZE;
 pub(crate) const PACKET_OVERHEAD: usize = params::PACKET_FIXED_OVERHEAD;

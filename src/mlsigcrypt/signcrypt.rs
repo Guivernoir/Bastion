@@ -607,6 +607,352 @@ fn unsigncrypt_inner(
 }
 
 #[cfg(test)]
+pub(crate) struct SigncryptTrace {
+    pub(crate) aad: Vec<u8>,
+    pub(crate) plaintext: Vec<u8>,
+    pub(crate) aad_digest: [u8; AAD_DIGEST_LEN],
+    pub(crate) rnd: [u8; 32],
+    pub(crate) rho_prime: [u8; 64],
+    pub(crate) attempts: usize,
+    pub(crate) accepted_kappa: u16,
+    pub(crate) ct_len_be: [u8; 8],
+    pub(crate) key_id_s: [u8; KEY_ID_LEN],
+    pub(crate) key_id_r: [u8; KEY_ID_LEN],
+    pub(crate) message_key: [u8; 32],
+    pub(crate) recovered_message_key: [u8; 32],
+    pub(crate) encap: [u8; ENCAP_LEN],
+    pub(crate) w1_packed: [u8; K * POLYW1_BYTES],
+    pub(crate) c_tilde: [u8; LAMBDA2_BYTES],
+    pub(crate) z_bytes: [u8; SIG_Z_LEN],
+    pub(crate) hint_bytes: [u8; SIG_HINT_LEN],
+    pub(crate) ciphertext: Vec<u8>,
+    pub(crate) packet: Vec<u8>,
+    pub(crate) opened_plaintext: Vec<u8>,
+}
+
+#[cfg(test)]
+pub(crate) fn signcrypt_reference_trace(
+    sk_user_s: &UserSecretKey,
+    pk_user_s: &UserPublicKey,
+    sk_user_r: &UserSecretKey,
+    pk_user_r: &UserPublicKey,
+    aad: &[u8],
+    plaintext: &[u8],
+    rnd: &[u8; 32],
+    message_key: &[u8; 32],
+) -> Result<SigncryptTrace, SigncryptOpenFailed> {
+    let pt_len = plaintext.len();
+    let packet_len = pt_len
+        .checked_add(PACKET_FIXED_OVERHEAD)
+        .ok_or(SigncryptOpenFailed)?;
+    if !pk_user_s.verify_consistency() || !pk_user_r.verify_consistency() {
+        return Err(SigncryptOpenFailed);
+    }
+
+    let mut packet = vec![0u8; packet_len];
+    let mut recipient_pk = PolyVec::<{ algebraic::ENC_K }>::zero();
+    let recipient_pk_ok = algebraic::decode_public_key(pk_user_r.pk_enc(), &mut recipient_pk);
+    debug_assert!(recipient_pk_ok, "validated recipient key must decode");
+    if !recipient_pk_ok {
+        return Err(SigncryptOpenFailed);
+    }
+
+    let mut recipient_pk_hat = PolyVec::<{ algebraic::ENC_K }>::zero();
+    for i in 0..algebraic::ENC_K {
+        recipient_pk_hat.polys[i]
+            .coeffs
+            .copy_from_slice(&recipient_pk.polys[i].coeffs);
+        recipient_pk_hat.polys[i].ntt();
+    }
+
+    packet[PKT_ALG_ID_OFF..PKT_VERSION_OFF].copy_from_slice(ALG_ID);
+    packet[PKT_VERSION_OFF] = VERSION;
+    packet[PKT_KEY_ID_S_OFF..PKT_KEY_ID_S_OFF + KEY_ID_LEN].copy_from_slice(pk_user_s.key_id());
+    packet[PKT_KEY_ID_R_OFF..PKT_KEY_ID_R_OFF + KEY_ID_LEN].copy_from_slice(pk_user_r.key_id());
+
+    let mut aad_digest = [0u8; AAD_DIGEST_LEN];
+    compute_aad_digest(aad, &mut aad_digest);
+
+    let mut rho = [0u8; 32];
+    let mut k_seed = [0u8; 32];
+    let mut tr = [0u8; 64];
+    let mut s1 = PolyVec::<L>::zero();
+    let mut s2 = PolyVec::<K>::zero();
+    let mut t0 = PolyVec::<K>::zero();
+    unpack_sk(
+        &mut rho,
+        &mut k_seed,
+        &mut tr,
+        &mut s1,
+        &mut s2,
+        &mut t0,
+        &sk_user_s.sk_sig,
+    );
+    s1.ntt();
+    s2.ntt();
+    t0.ntt();
+
+    let mut rho_prime = [0u8; 64];
+    shake256_absorb_squeeze(
+        &[
+            &k_seed,
+            rnd,
+            &aad_digest,
+            pk_user_s.key_id(),
+            pk_user_r.key_id(),
+        ],
+        &mut rho_prime,
+    );
+
+    let mut sign_mat_a = PolyMatrix::zero();
+    expand_a(&mut sign_mat_a, &rho);
+    let mut encap_mat_a = PolyMatrix::zero();
+    expand_a(&mut encap_mat_a, pk_user_r.rho_shared());
+
+    let ct_len_be = (pt_len as u64).to_be_bytes();
+    packet[PKT_CT_LEN_OFF..PKT_CT_OFF].copy_from_slice(&ct_len_be);
+
+    let mut kappa: u16 = 0;
+    let mut attempts = 0usize;
+    let mut y = PolyVec::<L>::zero();
+    let mut y_hat = PolyVec::<L>::zero();
+    let mut w_hat = PolyVec::<K>::zero();
+    let mut w = PolyVec::<K>::zero();
+    let mut w1 = PolyVec::<K>::zero();
+    let mut w0 = PolyVec::<K>::zero();
+    let mut c_hat = Poly::zero();
+    let mut cs1 = PolyVec::<L>::zero();
+    let mut cs2 = PolyVec::<K>::zero();
+    let mut ct0 = PolyVec::<K>::zero();
+    let mut z = PolyVec::<L>::zero();
+    let mut h = PolyVec::<K>::zero();
+    let mut c_tilde = [0u8; LAMBDA2_BYTES];
+    let mut w1_packed = [0u8; K * POLYW1_BYTES];
+    let mut encap = [0u8; ENCAP_LEN];
+
+    let accepted_kappa = 'outer: loop {
+        let kappa_this = kappa;
+        attempts += 1;
+        expand_mask(&mut y, &rho_prime, kappa_this);
+        kappa = kappa.wrapping_add(L as u16);
+
+        for i in 0..L {
+            y_hat.polys[i].coeffs.copy_from_slice(&y.polys[i].coeffs);
+            y_hat.polys[i].ntt();
+        }
+        sign_mat_a.matvec_ntt(&y_hat, &mut w_hat);
+
+        for i in 0..K {
+            w.polys[i].coeffs.copy_from_slice(&w_hat.polys[i].coeffs);
+            w.polys[i].inv_ntt();
+            w.polys[i].reduce();
+            w.polys[i].caddq();
+        }
+
+        for i in 0..K {
+            for j in 0..N {
+                let (r1, r0) = decompose(w.polys[i].coeffs[j]);
+                w1.polys[i].coeffs[j] = r1;
+                w0.polys[i].coeffs[j] = r0;
+            }
+        }
+
+        for i in 0..K {
+            let start = i * POLYW1_BYTES;
+            let end = start + POLYW1_BYTES;
+            let packed: &mut [u8; POLYW1_BYTES] = (&mut w1_packed[start..end])
+                .try_into()
+                .expect("fixed-size w1 chunk");
+            polyw1_pack(packed, &w1.polys[i]);
+        }
+
+        algebraic::encapsulate_from_mask(
+            &encap_mat_a,
+            &recipient_pk_hat,
+            &y,
+            message_key,
+            &mut encap,
+        );
+
+        packet[PKT_CT_OFF..PKT_CT_OFF + pt_len].copy_from_slice(plaintext);
+        xor_keystream_in_place(
+            message_key,
+            pk_user_s.key_id(),
+            pk_user_r.key_id(),
+            &encap,
+            &mut packet[PKT_CT_OFF..PKT_CT_OFF + pt_len],
+        );
+
+        compute_challenge(
+            &w1_packed,
+            &encap,
+            &aad_digest,
+            pk_user_s.pk_sig(),
+            pk_user_r.pk_enc(),
+            &packet[PKT_CT_OFF..PKT_CT_OFF + pt_len],
+            &mut c_tilde,
+        );
+
+        sample_in_ball(&mut c_hat, &c_tilde);
+        c_hat.ntt();
+
+        for i in 0..L {
+            for j in 0..N {
+                cs1.polys[i].coeffs[j] = fqmul(c_hat.coeffs[j], s1.polys[i].coeffs[j]);
+            }
+            cs1.polys[i].inv_ntt();
+            cs1.polys[i].reduce();
+        }
+        for i in 0..K {
+            for j in 0..N {
+                cs2.polys[i].coeffs[j] = fqmul(c_hat.coeffs[j], s2.polys[i].coeffs[j]);
+            }
+            cs2.polys[i].inv_ntt();
+            cs2.polys[i].reduce();
+
+            for j in 0..N {
+                ct0.polys[i].coeffs[j] = fqmul(c_hat.coeffs[j], t0.polys[i].coeffs[j]);
+            }
+            ct0.polys[i].inv_ntt();
+            ct0.polys[i].reduce();
+        }
+
+        for i in 0..L {
+            for j in 0..N {
+                z.polys[i].coeffs[j] = y.polys[i].coeffs[j].wrapping_add(cs1.polys[i].coeffs[j]);
+            }
+        }
+        if !z.check_norm_lt(GAMMA1 - BETA) {
+            continue 'outer;
+        }
+
+        let mut reject_r0 = false;
+        for i in 0..K {
+            for j in 0..N {
+                let value = w0.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]);
+                let r0 = reduce32(value);
+                w0.polys[i].coeffs[j] = r0;
+                if r0.abs() >= GAMMA2 - BETA {
+                    reject_r0 = true;
+                }
+            }
+        }
+        if reject_r0 {
+            continue 'outer;
+        }
+
+        if !ct0.check_norm_lt(GAMMA2) {
+            continue 'outer;
+        }
+
+        let mut hint_weight = 0usize;
+        for i in 0..K {
+            for j in 0..N {
+                let a0 = reduce32(w0.polys[i].coeffs[j].wrapping_add(ct0.polys[i].coeffs[j]));
+                w0.polys[i].coeffs[j] = a0;
+                let h_bit = make_hint(a0, w1.polys[i].coeffs[j]);
+                h.polys[i].coeffs[j] = h_bit;
+                hint_weight += h_bit as usize;
+            }
+        }
+        if hint_weight > OMEGA {
+            continue 'outer;
+        }
+
+        break 'outer kappa_this;
+    };
+
+    let mut sig = [0u8; SIG_BYTES];
+    pack_sig(&mut sig, &c_tilde, &z, &h);
+
+    packet[PKT_ENCAP_OFF..PKT_ENCAP_OFF + ENCAP_LEN].copy_from_slice(&encap);
+    packet[PKT_Z_OFF..PKT_Z_OFF + SIG_Z_LEN]
+        .copy_from_slice(&sig[SIG_CTILDE_LEN..SIG_CTILDE_LEN + SIG_Z_LEN]);
+    packet[PKT_CTILDE_OFF..PKT_CTILDE_OFF + SIG_CTILDE_LEN].copy_from_slice(&sig[..SIG_CTILDE_LEN]);
+    packet[PKT_HINT_OFF..PKT_HINT_OFF + SIG_HINT_LEN]
+        .copy_from_slice(&sig[SIG_CTILDE_LEN + SIG_Z_LEN..]);
+
+    let mut z_bytes = [0u8; SIG_Z_LEN];
+    z_bytes.copy_from_slice(&packet[PKT_Z_OFF..PKT_Z_OFF + SIG_Z_LEN]);
+    let mut hint_bytes = [0u8; SIG_HINT_LEN];
+    hint_bytes.copy_from_slice(&packet[PKT_HINT_OFF..PKT_HINT_OFF + SIG_HINT_LEN]);
+    let ciphertext = packet[PKT_CT_OFF..PKT_CT_OFF + pt_len].to_vec();
+
+    let mut recovered_message_key = [0u8; 32];
+    let encap_ref: &[u8; ENCAP_LEN] = packet[PKT_ENCAP_OFF..PKT_ENCAP_OFF + ENCAP_LEN]
+        .try_into()
+        .map_err(|_| SigncryptOpenFailed)?;
+    if !algebraic::decapsulate_from_seed(
+        &sk_user_r.sk_enc_seed,
+        encap_ref,
+        &mut recovered_message_key,
+    ) {
+        return Err(SigncryptOpenFailed);
+    }
+
+    let mut opened_plaintext = vec![0u8; pt_len];
+    let opened_len = unsigncrypt(
+        sk_user_r,
+        pk_user_s,
+        pk_user_r,
+        aad,
+        &packet,
+        &mut opened_plaintext,
+    )?;
+    opened_plaintext.truncate(opened_len);
+
+    let mut key_id_s = [0u8; KEY_ID_LEN];
+    key_id_s.copy_from_slice(pk_user_s.key_id());
+    let mut key_id_r = [0u8; KEY_ID_LEN];
+    key_id_r.copy_from_slice(pk_user_r.key_id());
+
+    zeroize_polyvec(&mut s1);
+    zeroize_polyvec(&mut s2);
+    zeroize_polyvec(&mut t0);
+    zeroize_polyvec(&mut y);
+    zeroize_polyvec(&mut y_hat);
+    zeroize_polyvec(&mut w_hat);
+    zeroize_polyvec(&mut w);
+    zeroize_polyvec(&mut w1);
+    zeroize_polyvec(&mut w0);
+    zeroize_polyvec(&mut cs1);
+    zeroize_polyvec(&mut cs2);
+    zeroize_polyvec(&mut ct0);
+    zeroize_polyvec(&mut z);
+    zeroize_polyvec(&mut h);
+    zeroize_polyvec(&mut recipient_pk);
+    zeroize_polyvec(&mut recipient_pk_hat);
+    zeroize_poly(&mut c_hat);
+    zeroize_array(&mut rho);
+    zeroize_array(&mut k_seed);
+    zeroize_array(&mut tr);
+    zeroize_array(&mut sig);
+
+    Ok(SigncryptTrace {
+        aad: aad.to_vec(),
+        plaintext: plaintext.to_vec(),
+        aad_digest,
+        rnd: *rnd,
+        rho_prime,
+        attempts,
+        accepted_kappa,
+        ct_len_be,
+        key_id_s,
+        key_id_r,
+        message_key: *message_key,
+        recovered_message_key,
+        encap,
+        w1_packed,
+        c_tilde,
+        z_bytes,
+        hint_bytes,
+        ciphertext,
+        packet,
+        opened_plaintext,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::mlsigcrypt::keys::keygen;
