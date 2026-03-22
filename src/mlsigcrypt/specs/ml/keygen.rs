@@ -103,6 +103,94 @@ pub(crate) fn keypair_with_matrix(
     zeroize_array(&mut k_seed);
 }
 
+#[cfg(test)]
+pub(crate) struct KeypairTrace {
+    pub(crate) seed: [u8; 32],
+    pub(crate) rho: [u8; 32],
+    pub(crate) rho_prime: [u8; 64],
+    pub(crate) k_seed: [u8; 32],
+    pub(crate) s1: PolyVec<L>,
+    pub(crate) s2: PolyVec<K>,
+    pub(crate) t: PolyVec<K>,
+    pub(crate) t1: PolyVec<K>,
+    pub(crate) t0: PolyVec<K>,
+    pub(crate) tr: [u8; 64],
+    pub(crate) pk: [u8; PK_BYTES],
+    pub(crate) sk: [u8; SK_BYTES],
+}
+
+#[cfg(test)]
+pub(crate) fn keypair_trace(seed: &[u8; 32]) -> KeypairTrace {
+    let mut expanded = [0u8; 128];
+    shake256_absorb_squeeze(&[seed.as_slice(), &[K as u8, L as u8]], &mut expanded);
+
+    let mut rho = [0u8; 32];
+    let mut rho_prime = [0u8; 64];
+    let mut k_seed = [0u8; 32];
+    rho.copy_from_slice(&expanded[..32]);
+    rho_prime.copy_from_slice(&expanded[32..96]);
+    k_seed.copy_from_slice(&expanded[96..128]);
+
+    let mut mat_a = PolyMatrix::zero();
+    expand_a(&mut mat_a, &rho);
+
+    let mut s1: PolyVec<L> = PolyVec::zero();
+    let mut s2: PolyVec<K> = PolyVec::zero();
+    expand_s(&mut s1, &mut s2, &rho_prime);
+
+    let mut s1_hat: PolyVec<L> = PolyVec::zero();
+    for i in 0..L {
+        s1_hat.polys[i].coeffs.copy_from_slice(&s1.polys[i].coeffs);
+        s1_hat.polys[i].ntt();
+    }
+
+    let mut w_hat: PolyVec<K> = PolyVec::zero();
+    mat_a.matvec_ntt(&s1_hat, &mut w_hat);
+
+    let mut t: PolyVec<K> = PolyVec::zero();
+    for i in 0..K {
+        t.polys[i].coeffs.copy_from_slice(&w_hat.polys[i].coeffs);
+        t.polys[i].inv_ntt();
+        t.polys[i].caddq();
+        t.polys[i].add_assign(&s2.polys[i]);
+        t.polys[i].caddq();
+    }
+
+    let mut t1: PolyVec<K> = PolyVec::zero();
+    let mut t0: PolyVec<K> = PolyVec::zero();
+    for i in 0..K {
+        t.polys[i].power2round_split(&mut t1.polys[i], &mut t0.polys[i]);
+    }
+
+    let mut pk = [0u8; PK_BYTES];
+    pack_pk(&mut pk, &rho, &t1);
+
+    let mut tr = [0u8; 64];
+    shake256_absorb_squeeze(&[pk.as_slice()], &mut tr);
+
+    let mut sk = [0u8; SK_BYTES];
+    pack_sk(&mut sk, &rho, &k_seed, &tr, &s1, &s2, &t0);
+
+    zeroize_polyvec(&mut s1_hat);
+    zeroize_polyvec(&mut w_hat);
+    zeroize_array(&mut expanded);
+
+    KeypairTrace {
+        seed: *seed,
+        rho,
+        rho_prime,
+        k_seed,
+        s1,
+        s2,
+        t,
+        t1,
+        t0,
+        tr,
+        pk,
+        sk,
+    }
+}
+
 fn keypair_from_rho(
     pk: &mut [u8; PK_BYTES],
     sk: &mut [u8; SK_BYTES],

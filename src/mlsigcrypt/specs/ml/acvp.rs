@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
     use crate::mlsigcrypt::specs::ml::field::{caddq, decompose, fqmul, make_hint_ct0, reduce32};
-    use crate::mlsigcrypt::specs::ml::keygen::keypair;
+    use crate::mlsigcrypt::specs::ml::keygen::{keypair, keypair_trace};
     use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
-    use crate::mlsigcrypt::specs::ml::packing::{pack_sig, polyw1_pack, unpack_sk};
+    use crate::mlsigcrypt::specs::ml::packing::{pack_sig, polyw1_pack, unpack_pk, unpack_sk};
     use crate::mlsigcrypt::specs::ml::params::{
         BETA, GAMMA1, GAMMA2, K, L, LAMBDA2_BYTES, N, OMEGA, PK_BYTES, POLYW1_BYTES, SIG_BYTES,
         SK_BYTES,
@@ -132,11 +132,51 @@ mod tests {
         hex::encode(sha256(input))
     }
 
+    fn first_byte_diff(label: &str, lhs: &[u8], rhs: &[u8]) -> Option<String> {
+        lhs.iter()
+            .zip(rhs.iter())
+            .enumerate()
+            .find_map(|(i, (left, right))| {
+                (left != right)
+                    .then(|| format!("{label}[{i}] local={left:02x} expected={right:02x}"))
+            })
+            .or_else(|| {
+                (lhs.len() != rhs.len())
+                    .then(|| format!("{label} length local={} expected={}", lhs.len(), rhs.len()))
+            })
+    }
+
+    fn first_poly_diff<const M: usize>(
+        label: &str,
+        lhs: &PolyVec<M>,
+        rhs: &PolyVec<M>,
+    ) -> Option<String> {
+        for i in 0..M {
+            for j in 0..N {
+                let left = lhs.polys[i].coeffs[j];
+                let right = rhs.polys[i].coeffs[j];
+                if left != right {
+                    return Some(format!(
+                        "{label}[poly={i}][coeff={j}] local={left} expected={right}"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn key_hash_hex(pk: &[u8; PK_BYTES], sk: &[u8; SK_BYTES]) -> String {
         let mut pk_sk = Vec::with_capacity(PK_BYTES + SK_BYTES);
         pk_sk.extend_from_slice(pk);
         pk_sk.extend_from_slice(sk);
         digest_hex(&pk_sk)
+    }
+
+    fn assert_hex_eq(label: &str, actual: &str, expected: &str) {
+        assert!(
+            actual.eq_ignore_ascii_case(expected),
+            "{label}: actual={actual} expected={expected}"
+        );
     }
 
     fn sign_internal_with_rejections(
@@ -307,7 +347,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "official ML-DSA ACVP example vectors do not match the current implementation; keep as an opt-in repro while investigation remains open"]
     fn fips_nist_acvp_table_1_rejection_case_vectors_match() {
         const VECTORS: [AcvpVector; 5] = [
             AcvpVector {
@@ -351,14 +390,19 @@ mod tests {
             let mut sig = [0u8; SIG_BYTES];
 
             keypair(&mut pk, &mut sk, &seed);
-            assert_eq!(key_hash_hex(&pk, &sk), vector.key_hash);
+            let key_hash = key_hash_hex(&pk, &sk);
+            assert_hex_eq("key hash", &key_hash, vector.key_hash);
             sign_internal_with_rejections(&mut sig, &msg, &sk, &[0u8; 32]);
-            assert_eq!(digest_hex(&sig), vector.sig_hash, "seed {}", vector.seed);
+            let sig_hash = digest_hex(&sig);
+            assert_hex_eq(
+                &format!("signature hash for seed {}", vector.seed),
+                &sig_hash,
+                vector.sig_hash,
+            );
         }
     }
 
     #[test]
-    #[ignore = "official ML-DSA ACVP example vectors do not match the current implementation; keep as an opt-in repro while investigation remains open"]
     fn fips_nist_acvp_table_2_rejection_counts_match() {
         const VECTORS: [AcvpCountVector; 5] = [
             AcvpCountVector {
@@ -407,7 +451,8 @@ mod tests {
             let mut sig = [0u8; SIG_BYTES];
 
             keypair(&mut pk, &mut sk, &seed);
-            assert_eq!(key_hash_hex(&pk, &sk), vector.key_hash);
+            let key_hash = key_hash_hex(&pk, &sk);
+            assert_hex_eq("key hash", &key_hash, vector.key_hash);
 
             let actual_rejections = sign_internal_with_rejections(&mut sig, &msg, &sk, &[0u8; 32]);
             assert_eq!(
@@ -415,7 +460,12 @@ mod tests {
                 "seed {}",
                 vector.seed
             );
-            assert_eq!(digest_hex(&sig), vector.sig_hash, "seed {}", vector.seed);
+            let sig_hash = digest_hex(&sig);
+            assert_hex_eq(
+                &format!("signature hash for seed {}", vector.seed),
+                &sig_hash,
+                vector.sig_hash,
+            );
         }
     }
 
@@ -427,5 +477,54 @@ mod tests {
             hex::encode(out),
             "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f"
         );
+    }
+
+    #[test]
+    #[ignore = "diagnostic trace for isolating the first ML-DSA-87 keygen divergence against official ACVP vectors"]
+    fn fips_nist_acvp_keygen_trace_isolates_first_divergence_for_mldsa87() {
+        const SEED: &str = "F7052FBB921759CD8716773BA6355630121D6927899FDDA5768E2BC240FCCB7B";
+        const EXPECTED_PK: &str = include_str!("testdata/mldsa87_acvp_keygen_tc51.pk.hex");
+        const EXPECTED_SK: &str = include_str!("testdata/mldsa87_acvp_keygen_tc51.sk.hex");
+        let seed = hex_to_array::<32>(SEED);
+        let expected_pk = hex_to_array::<PK_BYTES>(EXPECTED_PK.trim());
+        let expected_sk = hex_to_array::<SK_BYTES>(EXPECTED_SK.trim());
+
+        let trace = keypair_trace(&seed);
+
+        let mut expected_rho_from_pk = [0u8; 32];
+        let mut expected_t1 = PolyVec::<K>::zero();
+        unpack_pk(&mut expected_rho_from_pk, &mut expected_t1, &expected_pk);
+
+        let mut expected_rho_from_sk = [0u8; 32];
+        let mut expected_k_seed = [0u8; 32];
+        let mut expected_tr = [0u8; 64];
+        let mut expected_s1 = PolyVec::<L>::zero();
+        let mut expected_s2 = PolyVec::<K>::zero();
+        let mut expected_t0 = PolyVec::<K>::zero();
+        unpack_sk(
+            &mut expected_rho_from_sk,
+            &mut expected_k_seed,
+            &mut expected_tr,
+            &mut expected_s1,
+            &mut expected_s2,
+            &mut expected_t0,
+            &expected_sk,
+        );
+
+        let first = first_byte_diff("seed", &trace.seed, &seed)
+            .or_else(|| first_byte_diff("rho(pk)", &trace.rho, &expected_rho_from_pk))
+            .or_else(|| first_byte_diff("rho(sk)", &trace.rho, &expected_rho_from_sk))
+            .or_else(|| first_byte_diff("K", &trace.k_seed, &expected_k_seed))
+            .or_else(|| first_poly_diff("s1", &trace.s1, &expected_s1))
+            .or_else(|| first_poly_diff("s2", &trace.s2, &expected_s2))
+            .or_else(|| first_poly_diff("t0", &trace.t0, &expected_t0))
+            .or_else(|| first_poly_diff("t1", &trace.t1, &expected_t1))
+            .or_else(|| first_byte_diff("pk", &trace.pk, &expected_pk))
+            .or_else(|| first_byte_diff("tr", &trace.tr, &expected_tr))
+            .or_else(|| first_byte_diff("sk", &trace.sk, &expected_sk));
+
+        if let Some(diff) = first {
+            panic!("first divergence: {diff}");
+        }
     }
 }

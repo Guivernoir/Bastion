@@ -17,8 +17,9 @@ The headline result of the current review is:
 
 1. The only remaining theoretical open problem is the coupling between the
    signing mask `y` and the encapsulation randomness derived from it.
-2. The main remaining practical issue is that the embedded ML-DSA layer does not
-   currently reproduce official ACVP example outputs.
+2. The main remaining practical validation gap is that there is still no second
+   implementation of the full MLSigcrypt-v3 packet format for interoperability
+   or differential testing.
 3. Several previously listed items were stale and are no longer open.
 
 This does not make the scheme formally proven or production-ready. It narrows
@@ -85,26 +86,22 @@ analysis note now treats this as covered rather than open.
 
 ## Category 2: Implementation Status
 
-### 2.1 Official ML-DSA Validation Still Fails
+### 2.1 Official ML-DSA Validation Mismatch
 
-**Status**: Open.
+**Status**: Closed.
 
-This item replaces the earlier, narrower claim that the NTT constants were
-"not yet verified". The situation is now better understood:
+The ACVP mismatch was isolated by tracing the first ML-DSA-87 key-generation
+vector (`tcId 51`) field-by-field against the published semiexpanded key
+material. The first divergence appeared in `s1[0][0]`, which identified a sign
+inversion in `ExpandS`:
 
-- local arithmetic invariants pass,
-- deterministic KATs for MLSigcrypt-v3 pass,
-- a NIST SHAKE256 vector passes,
-- but ACVP-derived ML-DSA example checks do not match official example outputs.
+- local code sampled bounded coefficients as `b mod 5 - eta`,
+- the correct FIPS 204 convention is `eta - (b mod 5)`.
 
-The mismatch is therefore real and broader than a missing twiddle-factor spot
-check. It currently blocks any claim that the embedded ML-DSA path is known to
-match official FIPS 204 / ACVP behavior byte-for-byte.
-
-The reproduction harness lives in
-`src/mlsigcrypt/specs/ml/acvp.rs`. The failing example-vector tests are kept
-ignored in CI so the discrepancy remains reproducible without breaking the
-default test suite.
+After fixing that sampling bug, the traced key material matches the published
+vector, and the embedded ACVP example tests now agree with the official hashes
+and rejection counts. The only remaining difference in the harness was hex
+letter case, which is now normalized in the assertions.
 
 ### 2.2 Decapsulation Failure Bound
 
@@ -208,25 +205,18 @@ needed, it belongs in a higher-level protocol.
 
 ### 4.1 Official ACVP Example Mismatch
 
-**Status**: Open.
+**Status**: Closed.
 
-ACVP-derived ML-DSA example checks are now present and currently fail. This is
-the main newly documented practical issue uncovered during the review.
+The embedded ML-DSA ACVP checks now pass:
 
-Observed behavior:
+- key generation matches the published ML-DSA-87 semiexpanded vector,
+- the official example `SHA2-256(pk || sk)` hashes match,
+- the official example signature hashes match,
+- the published rejection counts match.
 
-- the first verified divergence is in the ML-DSA key-material path, before the
-  rejection loop becomes meaningful,
-- current implementation output hashes do not match official example signature
-  hashes,
-- current implementation rejection counts do not match official example counts,
-- the mismatch persists even after aligning the signing path with the corrected
-  `LowBits(w - cs2)` and hint-generation logic,
-- the root cause has not yet been isolated below "key generation / key-material
-  serialization and the data derived from it".
-
-Until this is resolved, the repository must not claim byte-level conformance of
-its ML-DSA layer to official ACVP examples.
+This closes the earlier practical blocker at the primitive-example level. It is
+still not a substitute for formal validation or for an independent second
+implementation of the full MLSigcrypt-v3 packet format.
 
 ### 4.2 No Full Cross-Implementation MLSigcrypt Reference
 
@@ -260,7 +250,7 @@ differential harness remains future work until a second implementation exists.
 | 1.2  | Proof           | EUF-CMA proof shape                                   | Medium   | Closed by analysis |
 | 1.3  | Proof           | Coupled signing/encapsulation randomness              | Critical | Open |
 | 1.4  | Proof           | Shared matrix security                                | Low      | Closed by analysis |
-| 2.1  | Implementation  | Official ML-DSA validation mismatch                   | High     | Open |
+| 2.1  | Implementation  | Official ML-DSA validation mismatch                   | High     | Closed |
 | 2.2  | Implementation  | Decapsulation failure bound                           | Medium   | Closed |
 | 2.3  | Implementation  | Packet size regression                                | Low      | Deferred |
 | 2.4  | Implementation  | Timing-floor configurability                          | Low      | Reduced to deployment config |
@@ -269,7 +259,7 @@ differential harness remains future work until a second implementation exists.
 | 3.2  | Design          | Rejected-iteration observability concern              | Low      | By design |
 | 3.3  | Design          | No forward secrecy                                    | Medium   | By design |
 | 3.4  | Design          | No explicit key confirmation                          | Low      | By design |
-| 4.1  | Validation      | ACVP-derived ML-DSA example mismatch                  | High     | Open |
+| 4.1  | Validation      | ACVP-derived ML-DSA example mismatch                  | High     | Closed |
 | 4.2  | Validation      | No full cross-implementation MLSigcrypt reference     | Medium   | Open |
 | 4.3  | Validation      | MLSigcrypt deterministic KAT constants                | Low      | Closed |
 | 4.4  | Validation      | No differential fuzzing against a reference           | Low      | Open |
@@ -280,9 +270,8 @@ differential harness remains future work until a second implementation exists.
 
 Priority order from here:
 
-1. Isolate and fix the ML-DSA ACVP mismatch.
-2. Build or obtain a second implementation of the full MLSigcrypt-v3 packet
+1. Build or obtain a second implementation of the full MLSigcrypt-v3 packet
    format for interoperability testing.
-3. Write the formal treatment of item `1.3`, the randomness-coupling problem.
-4. Revisit compression and packet-size work only after the above three items are
+2. Write the formal treatment of item `1.3`, the randomness-coupling problem.
+3. Revisit compression and packet-size work only after the above two items are
    settled.

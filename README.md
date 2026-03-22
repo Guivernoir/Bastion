@@ -45,9 +45,9 @@ This repository implements Level 3 only.
   signing mask `y` and the encapsulation randomness derived from it.
 - **Not FIPS 140-3 compliant.** The underlying ML-DSA-87 parameters are reused, but
   the overall packet construction is custom and not validated.
-- **Not currently demonstrated to match official ML-DSA ACVP examples.** The
-  embedded ML-DSA layer passes internal tests and protocol KATs, but official
-  example-vector agreement is still under investigation.
+- **Not a validated ML-DSA implementation.** The embedded ML-DSA layer now
+  matches the checked ACVP example vectors, but this crate is still not a FIPS
+  validated primitive or module.
 - **Not compatible** with Level 1 or Level 2 keys or packets.
 
 ---

@@ -122,16 +122,16 @@ fn rej_bounded_poly(p: &mut Poly, rho: &[u8; 64], nonce: u16) {
         for &byte in buf.iter() {
             let b0 = (byte & 0x0F) as i32;
             let b1 = (byte >> 4) as i32;
-            // Accept b if b < 15: coeff = b mod 5 − η = b mod 5 − 2.
+            // Accept b if b < 15: coeff = η − (b mod 5) = 2 − (b mod 5).
             if b0 < 15 {
-                p.coeffs[ctr] = b0 % 5 - ETA; // η = 2 → b%5 ∈ {0..4} → coeff ∈ {-2..2}
+                p.coeffs[ctr] = ETA - (b0 % 5); // η = 2 → b%5 ∈ {0..4} → coeff ∈ {-2..2}
                 ctr += 1;
                 if ctr == N {
                     break 'outer;
                 }
             }
             if b1 < 15 {
-                p.coeffs[ctr] = b1 % 5 - ETA;
+                p.coeffs[ctr] = ETA - (b1 % 5);
                 ctr += 1;
                 if ctr == N {
                     break 'outer;

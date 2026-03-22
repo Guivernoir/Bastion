@@ -16,11 +16,11 @@ begins.
 
 **The headline conclusion**: the implementation is hardened and most previously
 listed design gaps have been narrowed, but the scheme still has one unresolved
-theoretical issue and one unresolved external-validation issue:
+theoretical issue and one major external-validation gap:
 
 - the coupling between the signing mask `y` and the encapsulation randomness,
-- the current ML-DSA implementation does not yet match official ACVP example
-  outputs.
+- there is still no independent second implementation of the full
+  MLSigcrypt-v3 packet format for interoperability or differential testing.
 
 Deployments that require provable or standards-conformant guarantees should not
 use Level 3 until both are resolved.
@@ -306,9 +306,9 @@ construction is not a validated FIPS 140-3 module. The custom SHAKE-256 AEAD
 construction and the algebraic encapsulation are not covered by any existing
 validation.
 
-Additionally, the embedded ML-DSA implementation does not currently reproduce
-official ACVP example outputs, so FIPS-conformant ML-DSA behavior has not been
-established even at the primitive-validation level.
+The embedded ML-DSA implementation now matches the checked ACVP example vectors,
+but that does not constitute FIPS validation of either the primitive or the
+overall packet construction.
 
 Deployments that require FIPS 140-3 validated cryptography should use Level 1
 of the MLSigcrypt specification (ML-KEM-1024 + ML-DSA-87 + AES-256-GCM + HKDF),

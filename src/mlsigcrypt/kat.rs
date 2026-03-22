@@ -58,26 +58,26 @@ mod tests {
 
     /// Expected hex of sender key_id (32 bytes).
     const KAT_SENDER_KEY_ID: &str =
-        "0012cd951ee1590bedd26687a2535b4388a8e6e6cdbb26676e69eddd71e37316";
+        "b5b81a33b8758533113ecedf6c00e26e4c72e36c41eaf90250c5561d769b2a22";
     /// Expected hex of recipient key_id (32 bytes).
     const KAT_RECIPIENT_KEY_ID: &str =
-        "41973fc9ee914d92bace7e324abd7354cc1893f67d1e2c127adbb94013673999";
+        "9900c5097e17c920a78747e0acf762c574f806ac030d58676f87f7b5af43bab3";
     /// Expected hex of aad_digest (first 32 bytes).
     const KAT_AAD_DIGEST_HALF: &str =
         "6be51b49e4e472fc2b8abea53e0595e459c69aa64b6dca5ca4f37cf0211001b1";
     /// Expected hex of rho_prime (first 32 bytes).
     const KAT_RHO_PRIME_HALF: &str =
-        "a0ae44a96b0c9170d09f7496d7e3d81372f1832abbf726cdb3bfe67f59520baf";
+        "0f66706e0132f60eab5be9496009ea257d3949a609538aaf10d32de1773c3012";
     /// Expected kappa value at first accepted iteration.
-    const KAT_ACCEPTED_KAPPA: u16 = 35;
+    const KAT_ACCEPTED_KAPPA: u16 = 21;
     /// Expected hex of w1_packed (first 16 bytes).
-    const KAT_W1_PACKED_HEAD: &str = "ec21b7eafdecb4488248ef094faf856e";
+    const KAT_W1_PACKED_HEAD: &str = "c927d4bed73166b32dd7cabb1e1786e3";
     /// Expected hex of c_tilde (all 64 bytes).
-    const KAT_C_TILDE: &str = "a2dd88964b821a240e68defe3902088a1cac303eb17b5e9b491ce35cf4830b55a6d04d2c7db088ef84a9997e2ed396d3c95b0b0a9f71cb842e141c3204678638";
+    const KAT_C_TILDE: &str = "7236df61165993c215539b90b9bb47f6ac242fcf293c76595faa9009000d7e193778ad08397686422e9a60cc0b5e3038326ef24393f55d540fc3e4e7eea76866";
     /// Expected hex of encap field (first 32 bytes, packet bytes 78..110).
-    const KAT_ENCAP_HEAD: &str = "3acc2ec0e7690b2edfef110a9999f3854ad612763a7a8ebabf6d6749bc0e8c42";
+    const KAT_ENCAP_HEAD: &str = "3a363d4baae78584bef898c09ba3f5038b55adb058268da6ef336d372c5422f8";
     /// Expected hex of ciphertext field (all 16 bytes, for 16-byte plaintext).
-    const KAT_CIPHERTEXT: &str = "eec11d4d06daa9748f71209c728b2501";
+    const KAT_CIPHERTEXT: &str = "4a385fed02dd6d150eaaa6ebc182619d";
     /// Expected total packet length.
     const KAT_PACKET_LEN: usize = 8409;
 
