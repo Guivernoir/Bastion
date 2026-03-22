@@ -1,6 +1,6 @@
 # Security Documentation — Bastion / MLSigcrypt-v3
 
-Last updated: 2026-03-17
+Last updated: 2026-03-22
 
 ---
 
@@ -14,10 +14,16 @@ appropriate for a particular deployment. It tries to be specific about what
 is known, what is unknown, and where informal reasoning ends and formal proof
 begins.
 
-**The headline conclusion**: the implementation is hardened and the construction
-is structurally sound, but the scheme does not yet have a formal security proof.
-Deployments that require provable security guarantees should not use Level 3
-until such a proof exists and has been independently reviewed.
+**The headline conclusion**: the implementation is hardened and most previously
+listed design gaps have been narrowed, but the scheme still has one unresolved
+theoretical issue and one unresolved external-validation issue:
+
+- the coupling between the signing mask `y` and the encapsulation randomness,
+- the current ML-DSA implementation does not yet match official ACVP example
+  outputs.
+
+Deployments that require provable or standards-conformant guarantees should not
+use Level 3 until both are resolved.
 
 ---
 
@@ -112,7 +118,7 @@ MLSigcrypt-v3 computes:
 
 ```
 c̃ = SHAKE256(DOMAIN_CHAL ‖ w₁_packed ‖ encap ‖ aad_digest
-             ‖ pk_sig_S ‖ pk_enc_R ‖ ct_len ‖ ct)
+             ‖ tr_S ‖ pk_enc_R ‖ ct_len ‖ ct)
 ```
 
 This construction binds the ciphertext and encapsulation into the signing
@@ -121,11 +127,10 @@ invalidating `c̃`. It also means the sender implicitly signs the encryption
 — a packet signed by S for R under key `mkey` cannot be re-encrypted under
 a different `mkey` and remain valid.
 
-The deviation from the standard ML-DSA transcript (absorbing `pk_sig_S`
-directly rather than `H(pk_sig_S) = tr`) is intentional: it allows the
-challenge to bind the full verification key without a separate hash call.
-However, it means the standard EUF-CMA proof for ML-DSA does not transfer
-verbatim. The security argument requires a new reduction (see OPEN_PROBLEMS.md).
+The sender binding now uses the standard ML-DSA transcript hash
+`tr_S = SHAKE256(pk_sig_S)` rather than the raw public-key blob. The remaining
+proof work is therefore not about sender-key binding anymore; it is about the
+shared-randomness coupling described in [OPEN_PROBLEMS.md](OPEN_PROBLEMS.md).
 
 ### Keystream
 
@@ -208,8 +213,8 @@ The ML-DSA signing loop contains a rejection branch whose execution time leaks
 the number of iterations. This is not a vulnerability in the context of this
 scheme — the iteration count has a geometric distribution independent of secret
 material — but it does mean the per-call timing of `signcrypt` is variable. The
-public API timing floor (7 ms) absorbs small iteration-count variance but is not
-a hard constant-time bound.
+public API timing floor reduces small iteration-count variance but is not a hard
+constant-time bound.
 
 **Limitation**: The `ct_eq` helper uses `read_volatile` and a `compiler_fence`
 to prevent compiler-level short-circuits. It does not constitute a formal
@@ -224,17 +229,21 @@ Public API wrappers spin-loop until a floor time has elapsed:
 | Operation      | Floor    |
 |----------------|----------|
 | Key generation | 0 ns     |
-| Signcrypt      | 7 000 000 ns (7 ms) |
-| Unsigncrypt    | 1 500 000 ns (1.5 ms) |
+| Signcrypt      | 20 000 000 ns (20 ms) by default |
+| Unsigncrypt    | 10 000 000 ns (10 ms) by default |
 
 Key generation has no floor because it has no adversary-controlled input at the
 public boundary. The signcrypt floor is set above the expected signing time to
 absorb typical iteration-count variance. The unsigncrypt floor is set above the
 expected verification time to reduce early-exit timing signals on invalid packets.
 
-These floors are heuristic. They are measured on a developer machine and may not
-hold on significantly faster or slower hardware. They should be tuned for the
-target deployment environment.
+These floors are heuristic defaults and are configurable with the environment
+variables `BASTION_MLSIGCRYPT_KEYGEN_FLOOR_NS`,
+`BASTION_MLSIGCRYPT_SIGNCRYPT_FLOOR_NS`, and
+`BASTION_MLSIGCRYPT_UNSIGNCRYPT_FLOOR_NS`.
+
+They may not hold on significantly faster or slower hardware and should be tuned
+for the target deployment environment.
 
 ### Allocation and Dependency Policy
 
@@ -296,6 +305,10 @@ MLSigcrypt-v3 reuses ML-DSA-87 parameter sets (FIPS 204) but the overall packet
 construction is not a validated FIPS 140-3 module. The custom SHAKE-256 AEAD
 construction and the algebraic encapsulation are not covered by any existing
 validation.
+
+Additionally, the embedded ML-DSA implementation does not currently reproduce
+official ACVP example outputs, so FIPS-conformant ML-DSA behavior has not been
+established even at the primitive-validation level.
 
 Deployments that require FIPS 140-3 validated cryptography should use Level 1
 of the MLSigcrypt specification (ML-KEM-1024 + ML-DSA-87 + AES-256-GCM + HKDF),

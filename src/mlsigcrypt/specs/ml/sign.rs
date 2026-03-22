@@ -1,4 +1,4 @@
-use crate::mlsigcrypt::specs::ml::field::{decompose, fqmul, make_hint, reduce32};
+use crate::mlsigcrypt::specs::ml::field::{caddq, decompose, fqmul, make_hint_ct0, reduce32};
 use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
 use crate::mlsigcrypt::specs::ml::packing::{pack_sig, polyw1_pack, unpack_sk};
 /// ML-DSA-87 signing — FIPS 204 Algorithm 2.
@@ -192,8 +192,10 @@ pub(crate) fn sign(sig: &mut [u8; SIG_BYTES], msg: &[u8], sk: &[u8; SK_BYTES], r
         let mut reject_r0 = false;
         for i in 0..K {
             for j in 0..N {
-                let v = w0.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]);
-                let r0 = reduce32(v);
+                let r = caddq(reduce32(
+                    w.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]),
+                ));
+                let (_, r0) = decompose(r);
                 w0.polys[i].coeffs[j] = r0;
                 if r0.abs() >= GAMMA2 - BETA {
                     reject_r0 = true;
@@ -209,13 +211,15 @@ pub(crate) fn sign(sig: &mut [u8; SIG_BYTES], msg: &[u8], sk: &[u8; SK_BYTES], r
             continue 'outer;
         }
 
-        // ── h = MakeHint(w0 + ct0, w1) ───────────────────────────────────────
+        // ── h = MakeHint(-ct0, w - cs2 + ct0) ───────────────────────────────
         let mut hint_weight = 0usize;
         for i in 0..K {
             for j in 0..N {
-                let a0 = reduce32(w0.polys[i].coeffs[j].wrapping_add(ct0.polys[i].coeffs[j]));
-                w0.polys[i].coeffs[j] = a0;
-                let h_bit = make_hint(a0, w1.polys[i].coeffs[j]);
+                let h_bit = make_hint_ct0(
+                    ct0.polys[i].coeffs[j],
+                    w.polys[i].coeffs[j],
+                    cs2.polys[i].coeffs[j],
+                );
                 h.polys[i].coeffs[j] = h_bit;
                 hint_weight += h_bit as usize;
             }

@@ -18,6 +18,8 @@ mod os_random;
 mod zeroize;
 
 use crate::zeroize::{zeroize_array, zeroize_slice};
+use std::env;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 /// MLSigcrypt public identity size (bytes).
@@ -29,11 +31,56 @@ pub const MLSIGCRYPT_PACKET_OVERHEAD: usize = mlsigcrypt::PACKET_OVERHEAD;
 
 /// Best-effort timing floors for the public API wrappers (ns).
 ///
-/// Key generation is intentionally left unpadded because it has no
+/// Defaults are conservative on the current benchmark machine, but operators
+/// can override them with:
+/// `BASTION_MLSIGCRYPT_KEYGEN_FLOOR_NS`,
+/// `BASTION_MLSIGCRYPT_SIGNCRYPT_FLOOR_NS`, and
+/// `BASTION_MLSIGCRYPT_UNSIGNCRYPT_FLOOR_NS`.
+///
+/// Key generation is intentionally left unpadded by default because it has no
 /// adversary-controlled secret-dependent input at the public boundary.
-const FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS: u64 = 0;
-const FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS: u64 = 7_000_000;
-const FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS: u64 = 1_500_000;
+const DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS: u64 = 0;
+const DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS: u64 = 20_000_000;
+const DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS: u64 = 10_000_000;
+
+const ENV_FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS: &str = "BASTION_MLSIGCRYPT_KEYGEN_FLOOR_NS";
+const ENV_FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS: &str = "BASTION_MLSIGCRYPT_SIGNCRYPT_FLOOR_NS";
+const ENV_FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS: &str = "BASTION_MLSIGCRYPT_UNSIGNCRYPT_FLOOR_NS";
+
+#[derive(Clone, Copy)]
+struct PublicTimingFloors {
+    keygen_ns: u64,
+    signcrypt_ns: u64,
+    unsigncrypt_ns: u64,
+}
+
+static PUBLIC_TIMING_FLOORS: OnceLock<PublicTimingFloors> = OnceLock::new();
+
+#[inline]
+fn parse_floor_ns(value: Option<std::ffi::OsString>, default: u64) -> u64 {
+    value
+        .and_then(|raw| raw.into_string().ok())
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+#[inline]
+fn public_timing_floors() -> &'static PublicTimingFloors {
+    PUBLIC_TIMING_FLOORS.get_or_init(|| PublicTimingFloors {
+        keygen_ns: parse_floor_ns(
+            env::var_os(ENV_FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS),
+            DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS,
+        ),
+        signcrypt_ns: parse_floor_ns(
+            env::var_os(ENV_FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS),
+            DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS,
+        ),
+        unsigncrypt_ns: parse_floor_ns(
+            env::var_os(ENV_FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS),
+            DEFAULT_FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS,
+        ),
+    })
+}
 
 #[inline]
 fn enforce_public_floor(start: Instant, floor_ns: u64) {
@@ -62,7 +109,7 @@ pub fn mlsigcrypt_keygen(
         }
     };
 
-    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_KEYGEN_NS);
+    enforce_public_floor(start, public_timing_floors().keygen_ns);
     result
 }
 
@@ -83,7 +130,7 @@ pub fn mlsigcrypt_signcrypt(
                 "mlsigcrypt-v3 signcrypt failed"
             });
 
-    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_SIGNCRYPT_NS);
+    enforce_public_floor(start, public_timing_floors().signcrypt_ns);
     result
 }
 
@@ -109,7 +156,7 @@ pub fn mlsigcrypt_unsigncrypt(
         "mlsigcrypt-v3 open failed"
     });
 
-    enforce_public_floor(start, FLOOR_PUBLIC_MLSIGCRYPT_UNSIGNCRYPT_NS);
+    enforce_public_floor(start, public_timing_floors().unsigncrypt_ns);
     result
 }
 
@@ -185,6 +232,20 @@ mod tests {
                 &mut plaintext,
             ),
             Err("mlsigcrypt-v3 open failed")
+        );
+    }
+
+    #[test]
+    fn parse_floor_ns_uses_default_on_missing_or_invalid_input() {
+        assert_eq!(parse_floor_ns(None, 17), 17);
+        assert_eq!(parse_floor_ns(Some(std::ffi::OsString::from("42")), 17), 42);
+        assert_eq!(
+            parse_floor_ns(Some(std::ffi::OsString::from("  99  ")), 17),
+            99
+        );
+        assert_eq!(
+            parse_floor_ns(Some(std::ffi::OsString::from("not-a-number")), 17),
+            17
         );
     }
 }

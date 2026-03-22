@@ -40,10 +40,14 @@ This repository implements Level 3 only.
 - **Not a drop-in replacement for TLS, Signal, or any FIPS-validated scheme.** This
   is a research-grade primitive at an early maturity level.
 - **Not formally proven secure.** The construction is plausible and the implementation
-  is hardened, but the security proof reducing confidentiality and authenticity to
-  Module-LWE and Module-SIS respectively has not been written or peer-reviewed.
+  is hardened, but the remaining theoretical work is not complete. The only
+  unresolved theoretical problem currently tracked is the coupling between the
+  signing mask `y` and the encapsulation randomness derived from it.
 - **Not FIPS 140-3 compliant.** The underlying ML-DSA-87 parameters are reused, but
   the overall packet construction is custom and not validated.
+- **Not currently demonstrated to match official ML-DSA ACVP examples.** The
+  embedded ML-DSA layer passes internal tests and protocol KATs, but official
+  example-vector agreement is still under investigation.
 - **Not compatible** with Level 1 or Level 2 keys or packets.
 
 ---
@@ -191,7 +195,7 @@ Key sizes:
 
 At a high level, signcrypt performs the following steps:
 
-1. **Validate** both sender and recipient keys for internal consistency.
+1. **Decode and validate** the sender and recipient keys once at the API boundary.
 2. **Derive AAD digest**: `aad_digest = SHA3-512("MLSigcrypt-v3/aad\x03" ‖ aad)`.
 3. **Derive signing randomness**: `ρ' = SHAKE256(k_seed ‖ rnd ‖ aad_digest ‖ key_id_S ‖ key_id_R)`, where `rnd` is 32 fresh bytes from the OS (hedged signing).
 4. **Sample message key** `mkey` from the OS (32 bytes independent of `y`).
@@ -200,7 +204,7 @@ At a high level, signcrypt performs the following steps:
    - Compute `w = A · y`; decompose into high bits `w₁` and low bits `w₀`.
    - Compute the algebraic encapsulation: derive `r, e₁, e₂` from `SHAKE256(ENCAP_MASK_DOMAIN ‖ packed_y)`, then `u = Aᵀ · r + e₁`, `v = tᵣᵀ · r + e₂ + encode(mkey)`. Encode as `encap = u ‖ v`.
    - Encrypt the plaintext using `S_E = SHAKE256("MLSigcrypt-v3/enc\x03" ‖ mkey ‖ key_id_S ‖ key_id_R ‖ encap)`.
-   - Compute challenge: `c̃ = SHAKE256(DOMAIN_CHAL ‖ w₁_packed ‖ encap ‖ aad_digest ‖ pk_sig_S ‖ pk_enc_R ‖ ct_len ‖ ct)`.
+   - Compute challenge: `c̃ = SHAKE256(DOMAIN_CHAL ‖ w₁_packed ‖ encap ‖ aad_digest ‖ tr_S ‖ pk_enc_R ‖ ct_len ‖ ct)`, where `tr_S = SHAKE256(pk_sig_S)`.
    - Compute response `z = y + c · s₁` and hint `h`. Reject if norm bounds are exceeded or hint weight exceeds `ω`.
 6. **Write packet** in the layout above.
 7. **Zeroize** all sensitive intermediates.
@@ -228,22 +232,26 @@ prevents unauthenticated decryption oracles.
 
 ## Performance
 
-The following figures are from the `write_results` harness on a developer machine.
-They should be treated as indicative rather than definitive; results vary with
-hardware, OS scheduling, and the rejection-sampling loop's geometric distribution.
+A recent `write_results` run on the current developer machine measured roughly:
 
 | Operation      | Approximate time | Notes |
-|----------------|-----------------|-------|
-| Key generation | < 1 ms           | Floor = 0 ns (no padding) |
-| Signcrypt      | ~3–5 ms          | Floor = 7 ms (padded to floor) |
-| Unsigncrypt    | ~1–2 ms          | Floor = 1.5 ms (padded to floor) |
+|----------------|------------------|-------|
+| Key generation | ~3 ms            | Default floor = 0 ns |
+| Signcrypt      | ~15 ms           | Default floor = 20 ms |
+| Unsigncrypt    | ~8 ms            | Default floor = 10 ms |
 
-The performance improvement over Level 1/2 comes from eliminating the separate
-ML-KEM encapsulation pipeline. The single shared matrix `A` computed during key
-generation is reused across the signing and encapsulation paths.
+These numbers are indicative only. The rejection-sampling loop, OS scheduling,
+and hardware all affect the result.
 
-Timing floors are applied at the public API boundary to reduce observable variance.
-They are not a formal constant-time guarantee — see [SECURITY.md](SECURITY.md).
+Timing floors are applied at the public API boundary and can be overridden with:
+
+- `BASTION_MLSIGCRYPT_KEYGEN_FLOOR_NS`
+- `BASTION_MLSIGCRYPT_SIGNCRYPT_FLOOR_NS`
+- `BASTION_MLSIGCRYPT_UNSIGNCRYPT_FLOOR_NS`
+
+The defaults are heuristic placeholders, not a constant-time guarantee. Deployments
+that care about timing padding should calibrate them per platform. See
+[SECURITY.md](SECURITY.md).
 
 ---
 
@@ -251,7 +259,7 @@ They are not a formal constant-time guarantee — see [SECURITY.md](SECURITY.md)
 
 ```
 src/
-  lib.rs                     — public API and timing floors
+  lib.rs                     — public API and configurable timing floors
   mlsigcrypt/
     mod.rs                   — module root, public entry points
     keys.rs                  — key types, derivation, encoding
@@ -299,9 +307,14 @@ cargo clippy --locked --all-targets -- -D clippy::correctness
 # Tests (includes known-answer and integration tests)
 cargo test --locked --all-targets
 
-# Primitive vector gates
-cargo test --locked nist --all-targets
-cargo test --locked fips --all-targets
+# Deterministic protocol regression gate
+cargo test --locked mlsigcrypt::kat::tests::known_answer_assertions
+
+# Primitive sanity gate
+cargo test --locked mlsigcrypt::specs::ml::acvp::tests::shake256_empty_string_matches_nist_vector
+
+# Opt-in reproduction of the currently unresolved official ML-DSA vector mismatch
+cargo test --locked mlsigcrypt::specs::ml::acvp -- --ignored
 
 # Generate known-answer test vectors (prints hex intermediates)
 cargo test kat::tests::generate_test_vectors -- --nocapture --ignored

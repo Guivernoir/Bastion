@@ -10,6 +10,13 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_KEYGEN_FLOOR_NS: u64 = 0;
+const DEFAULT_SIGNCRYPT_FLOOR_NS: u64 = 20_000_000;
+const DEFAULT_UNSIGNCRYPT_FLOOR_NS: u64 = 10_000_000;
+const ENV_KEYGEN_FLOOR_NS: &str = "BASTION_MLSIGCRYPT_KEYGEN_FLOOR_NS";
+const ENV_SIGNCRYPT_FLOOR_NS: &str = "BASTION_MLSIGCRYPT_SIGNCRYPT_FLOOR_NS";
+const ENV_UNSIGNCRYPT_FLOOR_NS: &str = "BASTION_MLSIGCRYPT_UNSIGNCRYPT_FLOOR_NS";
+
 struct CountingAlloc;
 
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +96,37 @@ struct CtCheck {
     ratio_ppm: u64,
     threshold_ppm: u64,
     pass: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TimingFloors {
+    keygen_ns: u64,
+    signcrypt_ns: u64,
+    unsigncrypt_ns: u64,
+}
+
+fn parse_floor_ns(value: Option<std::ffi::OsString>, default: u64) -> u64 {
+    value
+        .and_then(|raw| raw.into_string().ok())
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn configured_timing_floors() -> TimingFloors {
+    TimingFloors {
+        keygen_ns: parse_floor_ns(
+            std::env::var_os(ENV_KEYGEN_FLOOR_NS),
+            DEFAULT_KEYGEN_FLOOR_NS,
+        ),
+        signcrypt_ns: parse_floor_ns(
+            std::env::var_os(ENV_SIGNCRYPT_FLOOR_NS),
+            DEFAULT_SIGNCRYPT_FLOOR_NS,
+        ),
+        unsigncrypt_ns: parse_floor_ns(
+            std::env::var_os(ENV_UNSIGNCRYPT_FLOOR_NS),
+            DEFAULT_UNSIGNCRYPT_FLOOR_NS,
+        ),
+    }
 }
 
 #[inline]
@@ -230,7 +268,11 @@ where
     }
 }
 
-fn write_report(metrics: &[Metric], ct_checks: &[CtCheck]) -> std::io::Result<()> {
+fn write_report(
+    metrics: &[Metric],
+    ct_checks: &[CtCheck],
+    floors: TimingFloors,
+) -> std::io::Result<()> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -245,6 +287,18 @@ fn write_report(metrics: &[Metric], ct_checks: &[CtCheck]) -> std::io::Result<()
     out.push_str("- perf: avg_ns/op, ops/sec\n");
     out.push_str("- alloc: calls/bytes/realloc, expected_zero_alloc (PASS|FAIL)\n");
     out.push_str("- memory: rss_before_kb, rss_after_kb, rss_delta_kb\n\n");
+
+    out.push_str("Timing Floor Configuration:\n");
+    out.push_str("===========================\n");
+    out.push_str(&format!(
+        "{}={}ns\n{}={}ns\n{}={}ns\n\n",
+        ENV_KEYGEN_FLOOR_NS,
+        floors.keygen_ns,
+        ENV_SIGNCRYPT_FLOOR_NS,
+        floors.signcrypt_ns,
+        ENV_UNSIGNCRYPT_FLOOR_NS,
+        floors.unsigncrypt_ns
+    ));
 
     for metric in metrics {
         let alloc_total_calls = metric.alloc.alloc_calls + metric.alloc.realloc_calls;
@@ -325,6 +379,7 @@ fn main() -> std::io::Result<()> {
     let packet_alt_len =
         mlsigcrypt_signcrypt(&sender_sk, &recipient_pk, &aad, &msg_alt, &mut packet_alt)
             .unwrap_or(0);
+    let floors = configured_timing_floors();
 
     let metrics = vec![
         measure("mlsigcrypt_keygen", 30, || {
@@ -409,7 +464,7 @@ fn main() -> std::io::Result<()> {
         ),
     ];
 
-    write_report(&metrics, &ct_checks)?;
+    write_report(&metrics, &ct_checks, floors)?;
     println!("wrote results.txt");
     Ok(())
 }

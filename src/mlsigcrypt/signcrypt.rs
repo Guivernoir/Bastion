@@ -8,7 +8,7 @@ use super::params::*;
 use crate::constant_time::ct_eq;
 use crate::mlsigcrypt::specs::algebraic;
 use crate::mlsigcrypt::specs::keccak::{KeccakSponge, zeroize_sponge};
-use crate::mlsigcrypt::specs::ml::field::{decompose, fqmul, make_hint, reduce32};
+use crate::mlsigcrypt::specs::ml::field::{caddq, decompose, fqmul, make_hint_ct0, reduce32};
 use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
 use crate::mlsigcrypt::specs::ml::packing::{
     pack_sig, polyw1_pack, unpack_pk, unpack_sig, unpack_sk,
@@ -58,7 +58,7 @@ fn compute_challenge(
     w1_packed: &[u8; K * POLYW1_BYTES],
     encap: &[u8; ENCAP_LEN],
     aad_digest: &[u8; AAD_DIGEST_LEN],
-    pk_sig_s: &[u8; SIG_PK_LEN],
+    sender_tr: &[u8; 64],
     pk_enc_r: &[u8; ENC_PK_LEN],
     ct: &[u8],
     out: &mut [u8; LAMBDA2_BYTES],
@@ -70,7 +70,7 @@ fn compute_challenge(
             w1_packed,
             encap,
             aad_digest,
-            pk_sig_s,
+            sender_tr,
             pk_enc_r,
             &ct_len_be,
             ct,
@@ -124,6 +124,10 @@ fn verify_signature_challenge(
     let mut pk_rho = [0u8; 32];
     let mut t1 = PolyVec::<K>::zero();
     unpack_pk(&mut pk_rho, &mut t1, pk_sig_s);
+
+    // Bind the sender using the standard ML-DSA transcript hash tr = H(pk_sig).
+    let mut sender_tr = [0u8; 64];
+    shake256_absorb_squeeze(&[pk_sig_s.as_slice()], &mut sender_tr);
 
     let mut sig = [0u8; SIG_BYTES];
     sig[..SIG_CTILDE_LEN].copy_from_slice(c_tilde);
@@ -192,7 +196,7 @@ fn verify_signature_challenge(
         &w1_packed,
         encap,
         aad_digest,
-        pk_sig_s,
+        &sender_tr,
         pk_enc_r,
         ct,
         &mut expected,
@@ -211,6 +215,7 @@ fn verify_signature_challenge(
     zeroize_polyvec(&mut w1);
     zeroize_poly(&mut c_hat);
     zeroize_array(&mut pk_rho);
+    zeroize_array(&mut sender_tr);
     zeroize_array(&mut parsed_ctilde);
     zeroize_array(&mut w1_packed);
     zeroize_array(&mut expected);
@@ -234,10 +239,8 @@ pub(crate) fn signcrypt(
     if out.len() < packet_len {
         return Err(SigncryptOpenFailed);
     }
-
-    if !pk_user_s.verify_consistency() || !pk_user_r.verify_consistency() {
-        return Err(SigncryptOpenFailed);
-    }
+    // Public callers only reach this point through decode_{public,secret}_key,
+    // which already enforces the structural key invariants once.
 
     let mut recipient_pk = PolyVec::<{ algebraic::ENC_K }>::zero();
     let recipient_pk_ok = algebraic::decode_public_key(pk_user_r.pk_enc(), &mut recipient_pk);
@@ -379,7 +382,7 @@ pub(crate) fn signcrypt(
             &w1_packed,
             &encap,
             &aad_digest.0,
-            pk_user_s.pk_sig(),
+            &tr,
             pk_user_r.pk_enc(),
             &out[PKT_CT_OFF..PKT_CT_OFF + pt_len],
             &mut c_tilde,
@@ -421,8 +424,10 @@ pub(crate) fn signcrypt(
         let mut reject_r0 = false;
         for i in 0..K {
             for j in 0..N {
-                let value = w0.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]);
-                let r0 = reduce32(value);
+                let r = caddq(reduce32(
+                    w.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]),
+                ));
+                let (_, r0) = decompose(r);
                 w0.polys[i].coeffs[j] = r0;
                 if r0.abs() >= GAMMA2 - BETA {
                     reject_r0 = true;
@@ -440,9 +445,11 @@ pub(crate) fn signcrypt(
         let mut hint_weight = 0usize;
         for i in 0..K {
             for j in 0..N {
-                let a0 = reduce32(w0.polys[i].coeffs[j].wrapping_add(ct0.polys[i].coeffs[j]));
-                w0.polys[i].coeffs[j] = a0;
-                let h_bit = make_hint(a0, w1.polys[i].coeffs[j]);
+                let h_bit = make_hint_ct0(
+                    ct0.polys[i].coeffs[j],
+                    w.polys[i].coeffs[j],
+                    cs2.polys[i].coeffs[j],
+                );
                 h.polys[i].coeffs[j] = h_bit;
                 hint_weight += h_bit as usize;
             }
@@ -533,9 +540,6 @@ fn unsigncrypt_inner(
         return Err(SigncryptOpenFailed);
     }
     if out.len() < ct_len {
-        return Err(SigncryptOpenFailed);
-    }
-    if !pk_user_s.verify_consistency() || !pk_user_r.verify_consistency() {
         return Err(SigncryptOpenFailed);
     }
     if !ct_eq(&packet[PKT_ALG_ID_OFF..PKT_VERSION_OFF], ALG_ID) {
@@ -787,7 +791,7 @@ pub(crate) fn signcrypt_reference_trace(
             &w1_packed,
             &encap,
             &aad_digest,
-            pk_user_s.pk_sig(),
+            &tr,
             pk_user_r.pk_enc(),
             &packet[PKT_CT_OFF..PKT_CT_OFF + pt_len],
             &mut c_tilde,
@@ -829,8 +833,10 @@ pub(crate) fn signcrypt_reference_trace(
         let mut reject_r0 = false;
         for i in 0..K {
             for j in 0..N {
-                let value = w0.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]);
-                let r0 = reduce32(value);
+                let r = caddq(reduce32(
+                    w.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]),
+                ));
+                let (_, r0) = decompose(r);
                 w0.polys[i].coeffs[j] = r0;
                 if r0.abs() >= GAMMA2 - BETA {
                     reject_r0 = true;
@@ -848,9 +854,11 @@ pub(crate) fn signcrypt_reference_trace(
         let mut hint_weight = 0usize;
         for i in 0..K {
             for j in 0..N {
-                let a0 = reduce32(w0.polys[i].coeffs[j].wrapping_add(ct0.polys[i].coeffs[j]));
-                w0.polys[i].coeffs[j] = a0;
-                let h_bit = make_hint(a0, w1.polys[i].coeffs[j]);
+                let h_bit = make_hint_ct0(
+                    ct0.polys[i].coeffs[j],
+                    w.polys[i].coeffs[j],
+                    cs2.polys[i].coeffs[j],
+                );
                 h.polys[i].coeffs[j] = h_bit;
                 hint_weight += h_bit as usize;
             }

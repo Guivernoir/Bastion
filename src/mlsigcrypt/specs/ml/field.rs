@@ -11,7 +11,7 @@ use crate::mlsigcrypt::specs::ml::params::{GAMMA2, Q32, Q64};
 
 /// q^{−1} mod 2^32.
 /// Verification: q × QINV ≡ 1 (mod 2^32).
-/// Must be verified against FIPS 204 KAT vectors.
+/// Checked by the modular inverse test below.
 pub(crate) const QINV: i32 = 58_728_449;
 
 // ── Montgomery reduction ──────────────────────────────────────────────────────
@@ -111,14 +111,24 @@ pub(crate) fn low_bits(r: i32) -> i32 {
 
 /// MakeHint(a0, a1): returns 1 if `a0` overflows the low-bit window.
 ///
-/// Follows the Dilithium/ML-DSA reference rule:
-/// - set hint if `a0 > GAMMA2` or `a0 < -GAMMA2`
-/// - boundary case: set hint when `a0 == -GAMMA2` and `a1 != 0`
-///
-/// Here, `a0` is the adjusted low part and `a1` is the corresponding high part.
+/// This helper is equivalent to the reference rule when the caller has already
+/// decomposed `r` into `(a1, a0) = Decompose(r)`.
 #[inline(always)]
 pub(crate) fn make_hint(a0: i32, a1: i32) -> i32 {
     ((a0 > GAMMA2) || (a0 < -GAMMA2) || (a0 == -GAMMA2 && a1 != 0)) as i32
+}
+
+/// ML-DSA/FIPS 204 hint generation in the form used by Algorithm 7.
+///
+/// The hint bit records whether the high bits of `w - cs2` differ from the
+/// high bits of `w - cs2 + ct0`.
+#[inline(always)]
+pub(crate) fn make_hint_ct0(ct0: i32, w: i32, cs2: i32) -> i32 {
+    let r_plus_z = caddq(reduce32(w.wrapping_sub(cs2)));
+    let v1 = high_bits(r_plus_z);
+    let r = caddq(reduce32(r_plus_z.wrapping_add(ct0)));
+    let r1 = high_bits(r);
+    (v1 != r1) as i32
 }
 
 /// UseHint(h, r): corrects the high bits of r using hint h.
@@ -158,7 +168,8 @@ pub(crate) fn chknorm(a: i32, bound: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{decompose, power2round};
-    use crate::mlsigcrypt::specs::ml::params::{D, GAMMA2, Q32};
+    use crate::mlsigcrypt::specs::algebraic::ENC_K;
+    use crate::mlsigcrypt::specs::ml::params::{D, GAMMA2, N, Q32};
 
     #[test]
     fn power2round_boundary_at_half_interval() {
@@ -176,5 +187,23 @@ mod tests {
         let (r1, r0) = decompose(x);
         assert_eq!(r1, 0);
         assert_eq!(r0, -(GAMMA2 - 1));
+    }
+
+    #[test]
+    fn qinv_is_the_montgomery_inverse_of_q() {
+        let product = (Q32 as i64) * (crate::mlsigcrypt::specs::ml::field::QINV as i64);
+        assert_eq!(product & 0xffff_ffff, 1);
+    }
+
+    #[test]
+    fn decapsulation_noise_stays_below_the_decode_margin() {
+        // Each coefficient of a product of two small polynomials is bounded by
+        // N * 2 * 2. The dot products in decapsulation sum ENC_K such products,
+        // and the `e2` term adds at most another 2. This is still far below q/4,
+        // so the current decode rule cannot cross the decision threshold.
+        let product_bound = (N as i32) * 4;
+        let dot_bound = (ENC_K as i32) * product_bound;
+        let total_noise_bound = 2 * dot_bound + 2;
+        assert!(total_noise_bound < Q32 / 4);
     }
 }

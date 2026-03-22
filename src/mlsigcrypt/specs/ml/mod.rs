@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod acvp;
 pub(crate) mod field;
 pub(crate) mod keygen;
 pub(crate) mod matrix;

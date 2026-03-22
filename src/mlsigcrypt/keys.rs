@@ -170,6 +170,8 @@ pub(crate) fn decode_public_key(bytes: &[u8]) -> Option<UserPublicKey> {
     }
     crate::mlsigcrypt::specs::ml::vec::zeroize_polyvec(&mut decoded_pk_enc);
 
+    // This is the canonical deserialization gate for public keys. Callers that
+    // operate on decoded keys may trust these structural invariants.
     let public = UserPublicKey {
         rho_shared,
         pk_enc,

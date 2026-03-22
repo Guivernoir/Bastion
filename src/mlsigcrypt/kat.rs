@@ -19,7 +19,7 @@ mod tests {
     use crate::mlsigcrypt::signcrypt::unsigncrypt;
     use crate::mlsigcrypt::specs::algebraic;
     use crate::mlsigcrypt::specs::keccak::{KeccakSponge, zeroize_sponge};
-    use crate::mlsigcrypt::specs::ml::field::{decompose, fqmul, make_hint, reduce32};
+    use crate::mlsigcrypt::specs::ml::field::{caddq, decompose, fqmul, make_hint_ct0, reduce32};
     use crate::mlsigcrypt::specs::ml::matrix::PolyMatrix;
     use crate::mlsigcrypt::specs::ml::packing::{pack_sig, polyw1_pack, unpack_sk};
     use crate::mlsigcrypt::specs::ml::params::{
@@ -57,25 +57,29 @@ mod tests {
     // ── KAT expected-value slots ──────────────────────────────────────────────
 
     /// Expected hex of sender key_id (32 bytes).
-    const KAT_SENDER_KEY_ID: &str = "0012cd951ee1590bedd26687a2535b4388a8e6e6cdbb26676e69eddd71e37316";
+    const KAT_SENDER_KEY_ID: &str =
+        "0012cd951ee1590bedd26687a2535b4388a8e6e6cdbb26676e69eddd71e37316";
     /// Expected hex of recipient key_id (32 bytes).
-    const KAT_RECIPIENT_KEY_ID: &str = "41973fc9ee914d92bace7e324abd7354cc1893f67d1e2c127adbb94013673999";
+    const KAT_RECIPIENT_KEY_ID: &str =
+        "41973fc9ee914d92bace7e324abd7354cc1893f67d1e2c127adbb94013673999";
     /// Expected hex of aad_digest (first 32 bytes).
-    const KAT_AAD_DIGEST_HALF: &str = "6be51b49e4e472fc2b8abea53e0595e459c69aa64b6dca5ca4f37cf0211001b1";
+    const KAT_AAD_DIGEST_HALF: &str =
+        "6be51b49e4e472fc2b8abea53e0595e459c69aa64b6dca5ca4f37cf0211001b1";
     /// Expected hex of rho_prime (first 32 bytes).
-    const KAT_RHO_PRIME_HALF: &str = "a0ae44a96b0c9170d09f7496d7e3d81372f1832abbf726cdb3bfe67f59520baf";
+    const KAT_RHO_PRIME_HALF: &str =
+        "a0ae44a96b0c9170d09f7496d7e3d81372f1832abbf726cdb3bfe67f59520baf";
     /// Expected kappa value at first accepted iteration.
-    const KAT_ACCEPTED_KAPPA: u16 = 35; 
+    const KAT_ACCEPTED_KAPPA: u16 = 35;
     /// Expected hex of w1_packed (first 16 bytes).
     const KAT_W1_PACKED_HEAD: &str = "ec21b7eafdecb4488248ef094faf856e";
     /// Expected hex of c_tilde (all 64 bytes).
-    const KAT_C_TILDE: &str = "65b0cf71483e86d640af7b3de6076179fbe824fd3d5fed73658713c82001e7906402ae3b12d06aca01e17c1d0b1553eede3124890651f8eb07b5616be3a1cee1";
+    const KAT_C_TILDE: &str = "a2dd88964b821a240e68defe3902088a1cac303eb17b5e9b491ce35cf4830b55a6d04d2c7db088ef84a9997e2ed396d3c95b0b0a9f71cb842e141c3204678638";
     /// Expected hex of encap field (first 32 bytes, packet bytes 78..110).
     const KAT_ENCAP_HEAD: &str = "3acc2ec0e7690b2edfef110a9999f3854ad612763a7a8ebabf6d6749bc0e8c42";
     /// Expected hex of ciphertext field (all 16 bytes, for 16-byte plaintext).
     const KAT_CIPHERTEXT: &str = "eec11d4d06daa9748f71209c728b2501";
     /// Expected total packet length.
-    const KAT_PACKET_LEN: usize = 8409; 
+    const KAT_PACKET_LEN: usize = 8409;
 
     // ── Utility ───────────────────────────────────────────────────────────────
 
@@ -102,7 +106,7 @@ mod tests {
         w1_packed: &[u8; K * POLYW1_BYTES],
         encap: &[u8; ENCAP_LEN],
         aad_digest: &[u8; AAD_DIGEST_LEN],
-        pk_sig_s: &[u8; SIG_PK_LEN],
+        sender_tr: &[u8; 64],
         pk_enc_r: &[u8; ENC_PK_LEN],
         ct: &[u8],
     ) -> [u8; LAMBDA2_BYTES] {
@@ -114,7 +118,7 @@ mod tests {
                 w1_packed,
                 encap,
                 aad_digest,
-                pk_sig_s,
+                sender_tr,
                 pk_enc_r,
                 &ct_len_be,
                 ct,
@@ -328,7 +332,7 @@ mod tests {
                 &w1_packed,
                 &encap,
                 &aad_digest,
-                pk_user_s.pk_sig(),
+                &tr,
                 pk_user_r.pk_enc(),
                 &out[PKT_CT_OFF..PKT_CT_OFF + pt_len],
             );
@@ -369,8 +373,10 @@ mod tests {
             let mut reject_r0 = false;
             for i in 0..K {
                 for j in 0..N {
-                    let v = w0.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]);
-                    let r0 = reduce32(v);
+                    let r = caddq(reduce32(
+                        w.polys[i].coeffs[j].wrapping_sub(cs2.polys[i].coeffs[j]),
+                    ));
+                    let (_, r0) = decompose(r);
                     w0.polys[i].coeffs[j] = r0;
                     if r0.abs() >= GAMMA2 - BETA {
                         reject_r0 = true;
@@ -387,9 +393,11 @@ mod tests {
             let mut hint_weight = 0usize;
             for i in 0..K {
                 for j in 0..N {
-                    let a0 = reduce32(w0.polys[i].coeffs[j].wrapping_add(ct0.polys[i].coeffs[j]));
-                    w0.polys[i].coeffs[j] = a0;
-                    let h_bit = make_hint(a0, w1.polys[i].coeffs[j]);
+                    let h_bit = make_hint_ct0(
+                        ct0.polys[i].coeffs[j],
+                        w.polys[i].coeffs[j],
+                        cs2.polys[i].coeffs[j],
+                    );
                     h.polys[i].coeffs[j] = h_bit;
                     hint_weight += h_bit as usize;
                 }

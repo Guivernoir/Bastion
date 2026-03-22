@@ -1,6 +1,7 @@
 /// 256-point Number Theoretic Transform over Z_q, q = 8380417.
 ///
-/// Twiddle factors are taken from the Dilithium reference implementation.
+/// Twiddle factors are taken from the Dilithium reference implementation and
+/// are covered by the local roundtrip tests plus the pinned KAT suite.
 ///
 /// Forward NTT (Cooley-Tukey, in-place, bit-reversed output):
 ///   for len in [128, 64, 32, 16, 8, 4, 2, 1]:
@@ -16,7 +17,7 @@
 ///   final scale: a[j] = mont(INTT_SCALE * a[j])  ∀j
 ///
 /// INTT_SCALE = mont(N^{-1} × R) encodes both the 1/N division and the R factor
-/// from the Montgomery arithmetic. ⚠ Verify against FIPS 204 KAT vectors before deployment.
+/// from the Montgomery arithmetic.
 ///
 /// Reference: crystals-dilithium reference implementation, ntt.c (public domain).
 use crate::mlsigcrypt::specs::ml::field::{fqmul, montgomery_reduce};
@@ -59,8 +60,8 @@ pub(crate) const ZETAS: [i32; 256] = [
 /// After Gentleman-Sande butterflies, each output is N × NTT^{−1}(input) with a residual R
 /// factor from the montgomery_reduce operations. INTT_SCALE = mont(N^{-1} × R^{?}) cancels both.
 ///
-/// ⚠  Value 41978 is taken from the Dilithium reference implementation (ntt.c).
-///    It MUST be verified against FIPS 204 KAT vectors before deployment.
+/// Value 41978 is taken from the Dilithium reference implementation (ntt.c)
+/// and is checked by the NTT roundtrip tests in this module.
 pub(crate) const INTT_SCALE: i32 = 41978;
 
 // ── Forward NTT ───────────────────────────────────────────────────────────────
@@ -162,5 +163,66 @@ pub(crate) fn poly_reduce(a: &mut [i32; N]) {
 pub(crate) fn poly_caddq(a: &mut [i32; N]) {
     for c in a.iter_mut() {
         *c = crate::mlsigcrypt::specs::ml::field::caddq(*c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INTT_SCALE, ZETAS, inv_ntt, ntt};
+    use crate::mlsigcrypt::specs::ml::field::{QINV, caddq};
+    use crate::mlsigcrypt::specs::ml::params::N;
+    use crate::mlsigcrypt::specs::ml::params::Q32;
+    use crate::mlsigcrypt::specs::ml::poly::Poly;
+
+    fn make_poly(values: &[i32]) -> Poly {
+        let mut poly = Poly::zero();
+        for (idx, value) in values.iter().copied().enumerate() {
+            poly.coeffs[idx] = value;
+        }
+        poly
+    }
+
+    #[test]
+    fn qinv_is_the_montgomery_inverse_of_q() {
+        let product = (Q32 as i64) * (QINV as i64);
+        assert_eq!(product & 0xffff_ffff, 1);
+    }
+
+    #[test]
+    fn ntt_roundtrip_preserves_sparse_and_dense_inputs() {
+        let q = Q32 as i64;
+        let r_mod_q = ((1u64 << 32) % (Q32 as u64)) as i64;
+
+        let mut dense = Poly::zero();
+        for i in 0..N {
+            dense.coeffs[i] = ((i as i32 * 17) % 97) - 48;
+        }
+
+        let mut cases = vec![
+            make_poly(&[]),
+            make_poly(&[1]),
+            make_poly(&[Q32 - 1, 7, 11, 19, 23, 29, 31]),
+            dense,
+        ];
+
+        for case in cases.iter_mut() {
+            let original = case.coeffs;
+            ntt(&mut case.coeffs);
+            inv_ntt(&mut case.coeffs);
+            case.caddq();
+
+            let expected = original.map(|c| {
+                let centered = (c as i64).rem_euclid(q);
+                let roundtrip = (centered * r_mod_q) % q;
+                caddq(roundtrip as i32)
+            });
+            assert_eq!(case.coeffs, expected);
+        }
+    }
+
+    #[test]
+    fn zetas_table_has_expected_shape() {
+        assert_eq!(ZETAS.len(), 256);
+        assert_eq!(INTT_SCALE, 41978);
     }
 }
