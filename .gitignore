@@ -3,6 +3,7 @@
 /criterion/
 1.0.0.md
 merge docs/
+research/next/
 
 # Fuzzing artifacts
 /fuzz/target/
